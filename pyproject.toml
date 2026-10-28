@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest>=7.3"]
 
 [project.gui-scripts]
 clondisk = "clondisk.__main__:main"
@@ -35,3 +35,6 @@ include = ["clondisk*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Cada prueba crea imágenes de disco de cientos de MiB; se borran al pasar
+# para no llenar el disco temporal (solo se conservan las de pruebas fallidas).
+tmp_path_retention_policy = "failed"

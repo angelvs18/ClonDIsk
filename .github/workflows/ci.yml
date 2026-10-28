@@ -24,7 +24,7 @@ jobs:
       - name: Pruebas
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest tests -q
+        run: python -m pytest tests -q --basetemp="$RUNNER_TEMP/pytest"
 
   build-exe:
     needs: test

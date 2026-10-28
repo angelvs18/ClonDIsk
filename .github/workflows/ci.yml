@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Herramientas de disco
+        run: sudo apt-get update && sudo apt-get install -y gdisk fdisk ntfs-3g dosfstools
+      - name: Dependencias
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Pruebas
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+  build-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generar ClonDisk.exe
+        run: .\build.bat
+        shell: cmd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClonDisk-exe
+          path: dist/ClonDisk.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-exe
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ClonDisk-exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ClonDisk.exe
+          generate_release_notes: true

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller (build.bat regenera ClonDisk.spec)
+build/
+dist/
+*.spec
+
+# Imágenes de disco del modo laboratorio
+*.img
+
+# Editores / SO
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

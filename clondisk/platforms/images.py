@@ -105,7 +105,7 @@ class ImagePlatform(Platform):
         if part.fs != "NTFS":
             raise ValueError("Solo se pueden reducir particiones NTFS")
         if new_size % ss or not 0 < new_size < part.size_bytes(ss):
-            raise ValueError(f"Tamaño inválido para reducir {part.display_name()}: {new_size}")
+            raise ValueError(f"Tamaño inválido para reducir {part.display_name()} ({new_size} bytes)")
         off = part.offset_bytes(ss)
         with tempfile.TemporaryDirectory(prefix="clondisk_lab_") as td:
             tmp = os.path.join(td, "part.bin")

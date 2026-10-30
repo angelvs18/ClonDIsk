@@ -70,6 +70,35 @@ def hint(text: str, color: str = "") -> QLabel:
 MIN_WIDTH, MIN_HEIGHT = 800, 560
 
 
+# display_name() ya incluye «:» cuando hay letra («E:»); estos textos no le añaden otro.
+def windows_label(part: Partition) -> str:
+    """Texto de «Windows de origen» (HTML)."""
+    info = part.win_info.display() if part.win_info else "versión no detectada"
+    state = "es el Windows en ejecución" if part.is_boot else "no está en ejecución"
+    return (f"<b>{html.escape(info)}</b> en {html.escape(part.display_name())} "
+            f"({state}).")
+
+
+def driver_backup_error_text(part: Partition, err) -> str:
+    return (f"No se pudieron respaldar los drivers de {part.display_name()}.\n\n{err}\n\n"
+            "¿Quieres continuar sin respaldo de drivers?")
+
+
+def driver_backup_done_text(part: Partition, res: DriverBackup) -> str:
+    how = "DISM /export-driver" if res.method == "dism" else \
+        "copia del DriverStore (DISM no pudo procesar ese Windows)"
+    text = f"Se respaldaron {res.count} driver(s) de {part.display_name()} mediante {how}.\n\n"
+    if res.used_fallback_dir:
+        text += ("No se pudo crear la carpeta en Documentos (suele deberse al «Acceso controlado "
+                 "a carpetas» de Windows Defender), así que el respaldo se guardó en la carpeta "
+                 "alternativa.\n\n")
+    text += f"Carpeta:\n{res.folder}"
+    if res.unmatched:
+        text += f"\n\n{len(res.unmatched)} oem*.inf sin carpeta: {', '.join(res.unmatched)}"
+    return (text + f"\n\nPara reinstalarlos: pnputil /add-driver \"{res.folder}\\*.inf\" "
+            "/subdirs /install")
+
+
 class CloneWizard(QDialog):
     def __init__(self, platform, disks: List[Disk], source: Optional[Disk] = None, parent=None):
         super().__init__(parent)
@@ -270,24 +299,14 @@ class CloneWizard(QDialog):
         def done(res, err):
             if err:
                 r = QMessageBox.question(
-                    self, "Respaldo de drivers",
-                    f"No se pudieron respaldar los drivers de {part.display_name()}:\n\n{err}\n\n"
-                    "¿Quieres continuar sin respaldo de drivers?",
+                    self, "Respaldo de drivers", driver_backup_error_text(part, err),
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if r == QMessageBox.Yes:
                     self.driver_backup_skipped = True
                     cont()
                 return
             self.driver_backup = res
-            how = "DISM /export-driver" if res.method == "dism" else \
-                "copia del DriverStore (DISM no pudo procesar ese Windows)"
-            extra = f"\n\n{len(res.unmatched)} oem*.inf sin carpeta: {', '.join(res.unmatched)}" \
-                if res.unmatched else ""
-            QMessageBox.information(
-                self, "Respaldo de drivers",
-                f"Se respaldaron {res.count} driver(s) de {part.display_name()} mediante {how}.\n\n"
-                f"Carpeta:\n{res.folder}{extra}\n\nPara reinstalarlos: "
-                f"pnputil /add-driver \"{res.folder}\\*.inf\" /subdirs /install")
+            QMessageBox.information(self, "Respaldo de drivers", driver_backup_done_text(part, res))
             cont()
 
         self._run_busy(work, done)
@@ -530,10 +549,7 @@ class CloneWizard(QDialog):
         self.lbl_verify_hint.setVisible(win is not None and not self.chk_verify.isChecked())
         self.g_win.setVisible(win is not None)
         if win is not None:
-            info = win.win_info.display() if win.win_info else "versión no detectada"
-            state = "es el Windows en ejecución" if win.is_boot else "no está en ejecución"
-            self.lbl_win.setText(f"<b>{html.escape(win.display_name())}</b>: {html.escape(info)} "
-                                 f"— {state}.")
+            self.lbl_win.setText(windows_label(win))
         can_backup = offline is not None and self.platform.supports_offline_windows
         self.chk_drivers.setEnabled(can_backup)
         if self._opts_source != src.number:
@@ -951,7 +967,7 @@ class CloneWizard(QDialog):
         win_html = ""
         if win is not None:
             info = win.win_info.display() if win.win_info else "versión no detectada"
-            win_html = f"<br>Windows en {e(win.display_name())}: <b>{e(info)}</b>"
+            win_html = f"<br>Windows: <b>{e(info)}</b> en {e(win.display_name())}"
         health = self._health_html()
         level = assess_health(self.health.get(p.source.number))[0] if health else "unknown"
         health_html = (f"<p style='color:{theme.DANGER if level == 'danger' else theme.MUTED}'>{health}</p>"

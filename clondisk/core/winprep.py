@@ -11,6 +11,7 @@ Aquí está la lógica que se puede probar sin discos reales ni ``winreg``:
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -135,6 +136,35 @@ class DriverBackup:
     count: int
     method: str                    # "dism" | "driverstore"
     unmatched: List[str] = field(default_factory=list)
+    used_fallback_dir: bool = False   # no se pudo usar Documentos
+
+
+DRIVER_BACKUP_FALLBACK_ROOT = "C:\\ClonDisk"
+
+
+def driver_backup_dir(documents: Optional[str], stamp: str,
+                      fallback_root: str = DRIVER_BACKUP_FALLBACK_ROOT,
+                      makedirs: Callable[..., None] = os.makedirs) -> Tuple[str, bool]:
+    """Crea ``<Documentos>\\ClonDisk\\drivers_<stamp>`` y, si no se puede (o no se conoce
+    la carpeta Documentos), ``<fallback_root>\\drivers_<stamp>``.
+    Devuelve (ruta creada, se_usó_la_alternativa)."""
+    if documents:
+        path = os.path.join(documents, "ClonDisk", f"drivers_{stamp}")
+        try:
+            makedirs(path, exist_ok=True)
+            if os.path.isdir(path):
+                return path, False
+        except OSError:
+            pass
+    path = os.path.join(fallback_root, f"drivers_{stamp}")
+    makedirs(path, exist_ok=True)
+    return path, True
+
+
+def count_inf_files(folder: str) -> int:
+    """Número de archivos .inf bajo ``folder`` (DISM exporta un subdirectorio por driver)."""
+    return sum(1 for _root, _dirs, files in os.walk(folder)
+               for f in files if f.lower().endswith(".inf"))
 
 
 def match_oem_driver_folders(oem: Dict[str, str],

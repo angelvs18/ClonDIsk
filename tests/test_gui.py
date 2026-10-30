@@ -76,3 +76,32 @@ def test_main_window_min_width_fits(app):
         assert m.minimumSizeHint().height() <= MAX_MIN_HEIGHT
     finally:
         m.close()
+
+
+# ---------------------------------------------------------------- «E:» una sola vez
+def test_drive_letter_shown_once(app):
+    from clondisk.core.winprep import DriverBackup
+    from clondisk.gui.wizard import (CloneWizard, driver_backup_done_text, driver_backup_error_text,
+                                     windows_label)
+    src, tgt = real_source(), real_target()
+    win = src.partitions[1]
+    assert win.display_name() == "E:"
+    err = FileNotFoundError(2, "El sistema no puede encontrar el archivo especificado")
+    texts = [windows_label(win), driver_backup_error_text(win, err),
+             driver_backup_done_text(win, DriverBackup(r"C:\ClonDisk\drivers_x", 12, "dism",
+                                                       used_fallback_dir=True))]
+    w = CloneWizard(Platform(), [src, tgt], src)
+    w.target = tgt
+    try:
+        w.show_page(2)
+        texts.append(w.lbl_win.text())
+        w._read_options()
+        w.show_page(3)
+        w.show_page(4)
+        texts.append(w.summary.toPlainText())
+    finally:
+        w.close()
+    for t in texts:
+        assert "E::" not in t, t
+    assert texts[0].count("E:") == 1 and texts[1].count("E:") == 1
+    assert "Windows 10 Pro" in texts[3] and "C:\\ClonDisk" in texts[2]

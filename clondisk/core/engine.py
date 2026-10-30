@@ -217,7 +217,7 @@ class CloneEngine:
                     sdev, sbase = self._source_for(pp, src)
                     copier.verify(sdev, sbase, dst, pp.new_start_lba * ss, self.ranges[pp.new_index],
                                   lba_base=pp.src.start_lba)
-                    self.log(f"Verificada {pp.src.display_name()}: OK")
+                    self.log(f"Verificada {pp.src.display_name()} — OK")
             else:
                 self.log("Verificación desactivada")
 
@@ -227,7 +227,7 @@ class CloneEngine:
                     changes = patch_hidden_sectors(dst, pp.new_start_lba * ss,
                                                    pp.new_sectors * ss, pp.new_start_lba)
                     for c in changes:
-                        self.log(f"{pp.src.display_name()}: {c}")
+                        self.log(f"{pp.src.display_name()} — {c}")
             identical = opts.id_mode == "same"
             # En modo idéntico se escriben primero IDs temporales (los nuevos).
             self._write_table(dst, plan.final_ids(identical=False))
@@ -364,15 +364,15 @@ class CloneEngine:
                     ranges, boot = ntfs_used_ranges(sdev, sbase, size)
                     used = sum(l for _, l in ranges)
                     self.ranges[pp.new_index] = ranges
-                    self.log(f"{pp.src.display_name()}: NTFS, clúster {boot.cluster_size} B, "
+                    self.log(f"{pp.src.display_name()} — NTFS, clúster {boot.cluster_size} B, "
                              f"{fmt_size(used)} en uso de {fmt_size(size)} ({len(ranges)} bloques)")
                     continue
                 except Exception as e:
-                    self.log(f"{pp.src.display_name()}: no se pudo leer el bitmap NTFS ({e}); "
+                    self.log(f"{pp.src.display_name()} — no se pudo leer el bitmap NTFS ({e}); "
                              "se copiará sector a sector", "warn")
                     pp.copy_mode = "raw"
             self.ranges[pp.new_index] = [(0, size)]
-            self.log(f"{pp.src.display_name()}: {pp.src.fs}, copia sector a sector de {fmt_size(size)}")
+            self.log(f"{pp.src.display_name()} — {pp.src.fs}, copia sector a sector de {fmt_size(size)}")
 
     def _wipe_tables(self, dst: Device):
         """Borra la tabla antigua (inicio) y la GPT de respaldo (final)."""

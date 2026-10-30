@@ -269,8 +269,8 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
             target_size = orig + free
             if used is not None and target_size * ss < used + margin:
                 err("El destino es demasiado pequeño incluso reduciendo la partición "
-                    f"{res_part.display_name()}: faltan "
-                    f"{((min_needed - target_size) * ss) // MiB} MiB")
+                    f"{res_part.display_name()} (faltan "
+                    f"{((min_needed - target_size) * ss) // MiB} MiB)")
             else:
                 err(f"El destino es {((-free) * ss) // MiB} MiB más pequeño de lo necesario. "
                     f"Reduce primero la partición {res_part.display_name()} del origen "

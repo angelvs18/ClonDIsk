@@ -26,8 +26,8 @@ from ..core.fs import ntfs_used_bytes
 from ..core.model import Disk, Partition, WindowsInfo, fmt_size
 from ..core.scan import scan_disk
 from ..core.winprep import (DiskHealth, DriverBackup, Hive, bcdedit_partition_letters,
-                            choose_bcdboot, enable_boot_storage_drivers,
-                            match_oem_driver_folders)
+                            choose_bcdboot, count_inf_files, driver_backup_dir,
+                            enable_boot_storage_drivers, match_oem_driver_folders)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -264,15 +264,29 @@ def _decode_log(raw: bytes) -> str:
     return raw.decode("utf-8" if raw.startswith(b"\xef\xbb\xbf") else "mbcs", "replace").lstrip("\ufeff")
 
 
-def _documents_dir() -> str:
-    """Carpeta «Documentos» del usuario (respeta la redirección a OneDrive)."""
+FOLDERID_DOCUMENTS = "FDD39AD0-238F-46AF-ADB4-6C85480369C7"
+
+
+def _documents_dir() -> Optional[str]:
+    """Carpeta «Documentos» real del usuario con SHGetKnownFolderPath(FOLDERID_Documents):
+    respeta la redirección (OneDrive, otra unidad). ``None`` si no se puede obtener; no se
+    arma la ruta a partir de %USERPROFILE%, porque puede no existir."""
+    import uuid
+    from ctypes import wintypes as wt
     try:
-        buf = ctypes.create_unicode_buffer(260)
-        if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:
-            return buf.value
+        guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(FOLDERID_DOCUMENTS).bytes_le)
+        path = ctypes.c_wchar_p()
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, wt.DWORD, wt.HANDLE,
+                                                 ctypes.POINTER(ctypes.c_wchar_p)]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        hr = shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path))
+        try:
+            return path.value if hr == 0 and path.value else None
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(path)
     except Exception:
-        pass
-    return os.path.join(os.path.expanduser("~"), "Documents")
+        return None
 
 
 def _file_digest(path: str) -> str:
@@ -540,19 +554,29 @@ if ($pd) {{
         porque ese Windows es más nuevo que el anfitrión) copia las carpetas del DriverStore
         que corresponden a los oem*.inf."""
         letter = self._require_offline_letter(part)
-        dest = os.path.join(_documents_dir(), "ClonDisk", "drivers_" + time.strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(dest, exist_ok=True)
+        docs = _documents_dir()
+        # La carpeta destino se crea completa ANTES de llamar a DISM.
+        dest, fallback = driver_backup_dir(docs, time.strftime("%Y%m%d_%H%M%S"))
+        if fallback:
+            log(f"No se pudo crear la carpeta en Documentos ({docs or 'desconocida'}); suele "
+                "deberse al «Acceso controlado a carpetas» de Windows Defender. El respaldo se "
+                f"guarda en {dest}", "warn")
         dism = os.path.join(_system32(), "dism.exe")
         cmd = f'"{dism}" /English /Image:{letter}:\\ /Export-Driver /Destination:"{dest}"'
         r = subprocess.run(cmd, capture_output=True, timeout=3600, creationflags=CREATE_NO_WINDOW)
         out = (r.stdout + r.stderr).decode("oem", "replace").strip()
+        infs = count_inf_files(dest) if r.returncode == 0 else 0
+        if infs:
+            log(f"DISM exportó {infs} driver(s) (.inf) a {dest}")
+            return DriverBackup(dest, infs, "dism", used_fallback_dir=fallback)
         if r.returncode == 0:
-            count = sum(1 for d in os.listdir(dest) if os.path.isdir(os.path.join(dest, d)))
-            log(f"DISM exportó {count} driver(s) a {dest}")
-            return DriverBackup(dest, count, "dism")
-        log(f"DISM /export-driver falló (código {r.returncode}): {out[-600:]}", "warn")
+            log("DISM terminó sin errores pero no exportó ningún .inf", "warn")
+        else:
+            log(f"DISM /export-driver falló (código {r.returncode}): {out[-600:]}", "warn")
         log("Se usa el respaldo alternativo: copia de carpetas del DriverStore", "warn")
-        return self._backup_driverstore(letter, dest, log)
+        backup = self._backup_driverstore(letter, dest, log)
+        backup.used_fallback_dir = fallback
+        return backup
 
     def _backup_driverstore(self, letter: str, dest: str, log: LogFn) -> DriverBackup:
         inf_dir = f"{letter}:\\Windows\\INF"
@@ -586,7 +610,9 @@ if ($pd) {{
         count = len(set(found.values()))
         if missing:
             log(f"{len(missing)} oem*.inf sin carpeta en el DriverStore: {', '.join(missing)}", "warn")
-        if oem and not count:
+        if not oem:
+            raise CommandError(f"No hay drivers de terceros (oem*.inf) en {inf_dir}")
+        if not count:
             raise CommandError("No se pudo emparejar ningún oem*.inf con el DriverStore")
         log(f"Copiadas {count} carpeta(s) de drivers del DriverStore a {dest}")
         return DriverBackup(dest, count, "driverstore", missing)
@@ -729,7 +755,7 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                 code = int(m.group(1))
                 msg = VSS_ERRORS.get(code, f"código {code}")
             raise CommandError(
-                f"No se pudo crear la instantánea VSS de {part.display_name()}: {msg}. "
+                f"No se pudo crear la instantánea VSS de {part.display_name()} ({msg}). "
                 "Comprueba que el servicio «Instantáneas de volumen» esté habilitado y que haya "
                 "espacio libre suficiente.") from None
         dev = WinDevice(info["Device"], sector_size=sector_size, extended_dasd=True)

@@ -679,3 +679,55 @@ def test_lab_shrink_partition_with_ntfsresize(mbr_source, tmp_path):
     extract(img, after.start_lba * 512, new_size, chk)
     r = subprocess.run(["ntfsresize", "-f", "-n", "-i", chk], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------- carpeta del respaldo de drivers
+from clondisk.core.winprep import count_inf_files, driver_backup_dir  # noqa: E402
+
+
+def test_driver_backup_dir_creates_missing_folders(tmp_path):
+    docs = tmp_path / "Users" / "angel" / "Documents"          # todavía no existe
+    path, fallback = driver_backup_dir(str(docs), "20261030_120000",
+                                       fallback_root=str(tmp_path / "fb"))
+    assert not fallback and os.path.isdir(path)
+    assert path == str(docs / "ClonDisk" / "drivers_20261030_120000")
+
+
+def test_driver_backup_dir_uses_redirected_documents(tmp_path):
+    onedrive = tmp_path / "OneDrive" / "Documentos"            # Documentos redirigido
+    onedrive.mkdir(parents=True)
+    path, fallback = driver_backup_dir(str(onedrive), "x", fallback_root=str(tmp_path / "fb"))
+    assert not fallback and path.startswith(str(onedrive)) and os.path.isdir(path)
+
+
+@pytest.mark.parametrize("docs", ["blocked", None])
+def test_driver_backup_dir_falls_back(tmp_path, docs):
+    blocked = str(tmp_path / "Documents")
+
+    def makedirs(p, exist_ok=False):
+        if p.startswith(blocked):    # como el «Acceso controlado a carpetas» de Defender
+            raise FileNotFoundError(2, "El sistema no puede encontrar el archivo especificado", p)
+        os.makedirs(p, exist_ok=exist_ok)
+
+    path, fallback = driver_backup_dir(blocked if docs else None, "20261030_120000",
+                                       fallback_root=str(tmp_path / "ClonDisk"),
+                                       makedirs=makedirs)
+    assert fallback and path == str(tmp_path / "ClonDisk" / "drivers_20261030_120000")
+    assert os.path.isdir(path)
+
+
+def test_count_inf_files(tmp_path):
+    assert count_inf_files(str(tmp_path)) == 0
+    for d in ("plotter.inf_amd64_1", "usb.inf_amd64_2"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / f"{d.split('.')[0]}.INF").write_text("x")
+        (tmp_path / d / "driver.sys").write_text("x")
+    assert count_inf_files(str(tmp_path)) == 2
+
+
+def test_partition_messages_no_double_colon():
+    from clondisk.core.planner import build_plan
+    src = real_source()
+    small = Disk(2, "ssd", "ssd", 40 * GiB)            # ni reduciendo cabe: error con «E:»
+    errs = " ".join(build_plan(src, small, CloneOptions()).errors)
+    assert "E:" in errs and "E::" not in errs

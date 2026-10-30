@@ -6,11 +6,12 @@ from typing import List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog,
                                QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
                                QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-                               QRadioButton, QScrollArea, QSlider, QStackedWidget, QTableWidget,
-                               QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget)
+                               QRadioButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget,
+                               QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget)
 
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, resizable_candidates,
@@ -39,6 +40,7 @@ def page_header(title: str, subtitle: str) -> QWidget:
     lay.setContentsMargins(0, 0, 0, 6)
     t = QLabel(title)
     t.setObjectName("PageTitle")
+    t.setWordWrap(True)
     s = QLabel(subtitle)
     s.setObjectName("PageSubtitle")
     s.setWordWrap(True)
@@ -50,16 +52,30 @@ def page_header(title: str, subtitle: str) -> QWidget:
 def scroll_wrap(inner: QWidget) -> QScrollArea:
     sa = QScrollArea()
     sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.NoFrame)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
     inner.setObjectName("ScrollBody")
     sa.setWidget(inner)
     return sa
+
+
+def hint(text: str, color: str = "") -> QLabel:
+    """Descripción con ajuste de línea bajo una casilla (las casillas no ajustan su texto)."""
+    lab = QLabel(text)
+    lab.setWordWrap(True)
+    lab.setStyleSheet(f"color:{color or theme.MUTED}; margin-left: 24px;")
+    return lab
+
+
+MIN_WIDTH, MIN_HEIGHT = 800, 560
 
 
 class CloneWizard(QDialog):
     def __init__(self, platform, disks: List[Disk], source: Optional[Disk] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Clonar disco")
-        theme.fit_to_screen(self, 1080, 760)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowMinMaxButtonsHint)
         self.platform = platform
         self.disks = disks
         self.source: Optional[Disk] = source
@@ -92,6 +108,11 @@ class CloneWizard(QDialog):
         rl.setContentsMargins(22, 18, 22, 14)
         self.stack = QStackedWidget()
         rl.addWidget(self.stack, 1)
+        # La navegación queda fuera de las páginas (que tienen scroll): siempre visible.
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color:{theme.BORDER};")
+        rl.addWidget(sep)
         nav = QHBoxLayout()
         nav.addStretch(1)
         self.btn_back = QPushButton("< Atrás")
@@ -111,7 +132,27 @@ class CloneWizard(QDialog):
         self.stack.addWidget(self._build_options_page())
         self.stack.addWidget(self._build_layout_page())
         self.stack.addWidget(self._build_summary_page())
+        self.stack.currentChanged.connect(self._fit_stack_to_page)
         self.show_page(0)
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        mw, mh = MIN_WIDTH, MIN_HEIGHT
+        if screen is not None:
+            avail = screen.availableGeometry()
+            mw, mh = min(mw, avail.width() - 20), min(mh, avail.height() - 50)
+        self.setMinimumSize(mw, mh)
+        theme.fit_to_screen(self, 1080, 760)
+
+    def _fit_stack_to_page(self, index: int):
+        """Solo la página visible cuenta para el tamaño: las ocultas no imponen su altura."""
+        for i in range(self.stack.count()):
+            pol = QSizePolicy.Preferred if i == index else QSizePolicy.Ignored
+            self.stack.widget(i).setSizePolicy(pol, pol)
+        page = self.stack.widget(index)
+        if page is not None:
+            page.adjustSize()
 
     # ------------------------------------------------------------------ navegación
     def show_page(self, i: int):
@@ -360,46 +401,50 @@ class CloneWizard(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(page_header("Opciones de clonación",
                                   "Los valores predeterminados son los recomendados para pasar de HDD a SSD."))
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 8, 0)
+        lay.addWidget(scroll_wrap(body), 1)
 
         g1 = QGroupBox("Copia")
         l1 = QVBoxLayout(g1)
-        self.chk_smart = QCheckBox("Copia inteligente: copiar solo los sectores en uso de NTFS (mucho más rápido)")
-        self.chk_vss = QCheckBox("Usar instantáneas VSS (permite clonar Windows mientras está en uso)")
-        self.chk_verify = QCheckBox("Verificar los datos copiados (duplica el tiempo)")
-        self.lbl_verify_hint = QLabel("Recomendado: el origen contiene Windows; verificar la copia "
-                                      "detecta errores de lectura del HDD o del adaptador USB.")
-        self.chk_skip_bad = QCheckBox("Saltar sectores ilegibles: copiarlos con ceros y anotar su LBA "
-                                      "(si no, la copia se detiene en el primero)")
-        for c in (self.chk_smart, self.chk_vss, self.chk_verify, self.lbl_verify_hint, self.chk_skip_bad):
-            l1.addWidget(c)
-        self.lbl_verify_hint.setWordWrap(True)
-        self.lbl_verify_hint.setStyleSheet(f"color:{theme.WARN}; margin-left: 24px;")
+        self.chk_smart = QCheckBox("Copia inteligente")
+        self.chk_vss = QCheckBox("Usar instantáneas VSS")
+        self.chk_verify = QCheckBox("Verificar los datos copiados")
+        self.lbl_verify_hint = hint("Recomendado: el origen contiene Windows; verificar la copia "
+                                    "detecta errores de lectura del HDD o del adaptador USB.", theme.WARN)
+        self.chk_skip_bad = QCheckBox("Saltar sectores ilegibles")
+        for x in (self.chk_smart,
+                  hint("Copia solo los sectores en uso de NTFS (mucho más rápido)."),
+                  self.chk_vss, hint("Permite clonar Windows mientras está en uso."),
+                  self.chk_verify, hint("Duplica el tiempo de la copia."), self.lbl_verify_hint,
+                  self.chk_skip_bad,
+                  hint("Los copia con ceros y anota su LBA. Si no se marca, la copia se detiene "
+                       "en el primero.")):
+            l1.addWidget(x)
         self.chk_vss.setEnabled(self.platform.supports_vss)
-        lay.addWidget(g1)
+        bl.addWidget(g1)
 
         self.g_win = QGroupBox("Windows de origen")
         lw = QVBoxLayout(self.g_win)
         self.lbl_win = QLabel()
         self.lbl_win.setWordWrap(True)
-        self.chk_drivers = QCheckBox("Respaldar drivers del Windows de origen (en Documentos\\ClonDisk) "
-                                     "antes de reducir o clonar")
-        lw.addWidget(self.lbl_win)
-        lw.addWidget(self.chk_drivers)
-        lay.addWidget(self.g_win)
+        self.chk_drivers = QCheckBox("Respaldar drivers del Windows de origen")
+        for x in (self.lbl_win, self.chk_drivers,
+                  hint("Se guardan en Documentos\\ClonDisk antes de reducir o clonar.")):
+            lw.addWidget(x)
+        bl.addWidget(self.g_win)
 
         g2 = QGroupBox("Identificadores del disco y arranque")
         l2 = QVBoxLayout(g2)
         self.rb_new = QRadioButton("Nuevos identificadores + reparar arranque (recomendado)")
-        d1 = QLabel("El SSD recibe GUID/firma nuevos, se reconstruye el arranque con bcdboot y se "
-                    "actualizan las letras de unidad del Windows clonado. Puedes dejar ambos discos "
-                    "conectados sin conflictos y las particiones quedan alineadas a 1 MiB.")
+        d1 = hint("El SSD recibe GUID/firma nuevos, se reconstruye el arranque con bcdboot y se "
+                  "actualizan las letras de unidad del Windows clonado. Puedes dejar ambos discos "
+                  "conectados sin conflictos y las particiones quedan alineadas a 1 MiB.")
         self.rb_same = QRadioButton("Identificadores idénticos (clon exacto)")
-        d2 = QLabel("El SSD conserva los mismos GUID/firma que el origen. Al terminar queda offline "
-                    "para evitar colisiones: debes retirar el disco de origen antes de arrancar.")
-        for d in (d1, d2):
-            d.setWordWrap(True)
-            d.setStyleSheet(f"color:{theme.MUTED}; margin-left: 24px;")
-        self.chk_boot = QCheckBox("Reconstruir el arranque y MountedDevices del Windows clonado")
+        d2 = hint("El SSD conserva los mismos GUID/firma que el origen. Al terminar queda offline "
+                  "para evitar colisiones: debes retirar el disco de origen antes de arrancar.")
+        self.chk_boot = QCheckBox("Reconstruir el arranque y MountedDevices")
         self.chk_boot.setStyleSheet("margin-left: 24px;")
         grp = QButtonGroup(self)
         grp.addButton(self.rb_new)
@@ -407,15 +452,13 @@ class CloneWizard(QDialog):
         self.rb_new.toggled.connect(lambda on: self.chk_boot.setEnabled(on))
         for x in (self.rb_new, d1, self.chk_boot, self.rb_same, d2):
             l2.addWidget(x)
-        lay.addWidget(g2)
+        bl.addWidget(g2)
 
         self.g_fw = QGroupBox("Formato de arranque del destino")
         lf = QVBoxLayout(self.g_fw)
         self.rb_keep_mbr = QRadioButton("Igual que el origen (MBR/BIOS)")
         self.rb_to_gpt = QRadioButton("Convertir a GPT/UEFI (recomendado para equipos modernos)")
-        self.lbl_fw = QLabel()
-        self.lbl_fw.setWordWrap(True)
-        self.lbl_fw.setStyleSheet(f"color:{theme.MUTED}; margin-left: 24px;")
+        self.lbl_fw = hint("")
         grp_fw = QButtonGroup(self)
         for x in (self.rb_keep_mbr, self.rb_to_gpt):
             grp_fw.addButton(x)
@@ -423,23 +466,23 @@ class CloneWizard(QDialog):
             lf.addWidget(x)
         self.rb_new.toggled.connect(lambda _on: self._update_fw_controls())
         self.chk_boot.toggled.connect(lambda _on: self._update_fw_controls())
-        lay.addWidget(self.g_fw)
+        bl.addWidget(self.g_fw)
 
         g3 = QGroupBox("Al terminar")
         l3 = QVBoxLayout(g3)
-        self.chk_trim = QCheckBox("Enviar TRIM al SSD (optimiza el rendimiento desde el principio)")
-        self.chk_dry = QCheckBox("Simulación: analizar y validar todo sin escribir en el destino")
-        self.chk_newhw = QCheckBox("El SSD irá a otra computadora (habilitar los drivers de "
-                                   "almacenamiento AHCI, NVMe e Intel RST del Windows clonado)")
-        d3 = QLabel("Evita la pantalla azul INACCESSIBLE_BOOT_DEVICE con otra controladora. Windows y "
-                    "el software con licencia (p. ej. el del plotter) pueden pedir reactivación por "
-                    "el cambio de hardware.")
-        d3.setWordWrap(True)
-        d3.setStyleSheet(f"color:{theme.MUTED}; margin-left: 24px;")
-        for x in (self.chk_trim, self.chk_newhw, d3, self.chk_dry):
+        self.chk_trim = QCheckBox("Enviar TRIM al SSD")
+        self.chk_dry = QCheckBox("Simulación")
+        self.chk_newhw = QCheckBox("El SSD irá a otra computadora")
+        for x in (self.chk_trim, hint("Optimiza el rendimiento del SSD desde el principio."),
+                  self.chk_newhw,
+                  hint("Habilita los drivers de almacenamiento AHCI, NVMe e Intel RST del Windows "
+                       "clonado. Evita la pantalla azul INACCESSIBLE_BOOT_DEVICE con otra "
+                       "controladora. Windows y el software con licencia (p. ej. el del plotter) "
+                       "pueden pedir reactivación por el cambio de hardware."),
+                  self.chk_dry, hint("Analiza y valida todo sin escribir en el destino.")):
             l3.addWidget(x)
-        lay.addWidget(g3)
-        lay.addStretch(1)
+        bl.addWidget(g3)
+        bl.addStretch(1)
 
         o = self.options
         self.chk_smart.setChecked(o.smart_copy)
@@ -529,12 +572,20 @@ class CloneWizard(QDialog):
         lay.addWidget(page_header("Distribución de particiones en el destino",
                                   "Las particiones de sistema conservan su tamaño; la partición de datos "
                                   "se ajusta al espacio del SSD. Todo queda alineado a 1 MiB."))
+        body = QWidget()
+        outer = lay
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 8, 0)
+        lay.setSpacing(8)
+        outer.addWidget(scroll_wrap(body), 1)
         self.lbl_src = QLabel()
+        self.lbl_src.setWordWrap(True)
         self.lbl_src.setStyleSheet("font-weight:600;")
         lay.addWidget(self.lbl_src)
         self.map_src = DiskMapWidget()
         lay.addWidget(self.map_src)
         self.lbl_dst = QLabel()
+        self.lbl_dst.setWordWrap(True)
         self.lbl_dst.setStyleSheet("font-weight:600;")
         lay.addWidget(self.lbl_dst)
         self.map_dst = DiskMapWidget()
@@ -585,6 +636,7 @@ class CloneWizard(QDialog):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setMinimumHeight(170)
         lay.addWidget(self.table, 1)
         return w
 
@@ -832,7 +884,10 @@ class CloneWizard(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(page_header("Resumen", "Revisa las operaciones antes de iniciar."))
+        # QTextBrowser ya es un área con scroll; la casilla de confirmación queda fija
+        # debajo, junto a la navegación.
         self.summary = QTextBrowser()
+        self.summary.setMinimumHeight(120)
         lay.addWidget(self.summary, 1)
         self.confirm = QCheckBox()
         self.confirm.toggled.connect(lambda _: self._update_next())
@@ -940,6 +995,7 @@ class CloneWizard(QDialog):
         """)
         self._fetch_health()
         self.confirm.setChecked(False)
-        self.confirm.setText(f"Entiendo que se borrará todo el contenido del Disco {p.target.number} "
-                             f"({p.target.model})" if not o.dry_run else
+        # Texto corto: QCheckBox no ajusta líneas (el modelo del disco ya está en el resumen).
+        self.confirm.setText(f"Entiendo que se borrará todo el contenido del Disco {p.target.number}"
+                             if not o.dry_run else
                              "Entiendo que es una simulación y no se copiará nada")

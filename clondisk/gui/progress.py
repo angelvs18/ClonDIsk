@@ -8,9 +8,9 @@ import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget,
+from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
-                               QTextEdit, QVBoxLayout, QWidget)
+                               QScrollArea, QTextEdit, QVBoxLayout, QWidget)
 
 from ..core.engine import STEPS, CloneEngine, CloneResult, fmt_lbas
 from ..core.model import fmt_size
@@ -118,6 +118,8 @@ class ProgressDialog(QDialog):
     def __init__(self, platform, plan: ClonePlan, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Clonando disco")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowMinMaxButtonsHint)
         theme.fit_to_screen(self, 900, 640)
         self.setModal(True)
         self.result: CloneResult | None = None
@@ -157,8 +159,14 @@ class ProgressDialog(QDialog):
         self.checks.setWordWrap(True)
         self.checks.setTextFormat(Qt.RichText)
         self.checks.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.checks.hide()
-        lay.addWidget(self.checks)
+        # Con scroll y altura limitada: una lista larga no empuja los botones fuera de la pantalla.
+        self.checks_area = QScrollArea()
+        self.checks_area.setWidgetResizable(True)
+        self.checks_area.setFrameShape(QFrame.NoFrame)
+        self.checks_area.setWidget(self.checks)
+        self.checks_area.setMaximumHeight(200)
+        self.checks_area.hide()
+        lay.addWidget(self.checks_area)
 
         self.step_label = QLabel("Preparando…")
         self.step_label.setStyleSheet("font-weight:600;")
@@ -310,7 +318,7 @@ class ProgressDialog(QDialog):
                          f"{html.escape(fmt_lbas(result.bad_sectors))}")
         if parts:
             self.checks.setText("<br><br>".join(parts))
-            self.checks.show()
+            self.checks_area.show()
 
     def _ask_cancel(self):
         if not self._running:

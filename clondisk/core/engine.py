@@ -9,8 +9,11 @@ Secuencia (modo «nuevos identificadores»):
 5. Verificar (opcional) y corregir «hidden sectors» de particiones movidas.
 6. Escribir la tabla de particiones (al final: si se cancela, el destino queda vacío).
 7. Conectar el destino, ampliar NTFS en las particiones agrandadas.
-8. Reconstruir el arranque (bcdboot) y actualizar MountedDevices del Windows clonado.
-9. TRIM del SSD.
+8. Reconstruir el arranque (bcdboot) y actualizar MountedDevices del Windows clonado;
+   opcionalmente, habilitar los drivers de almacenamiento para otra computadora.
+9. Convertir a GPT/UEFI con mbr2gpt (opcional, solo origen MBR).
+10. Comprobar que el destino puede arrancar (MBR/EFI, BCD, hidden sectors).
+11. TRIM del SSD.
 
 En modo «identificadores idénticos» se trabaja con IDs temporales y al final
 se escriben los originales con el disco ya offline (evita colisiones de firma).
@@ -31,6 +34,11 @@ from .gpt import GptEntry, build_gpt
 from .mbr import MbrEntry, build_mbr
 from .model import MiB, fmt_size
 from .planner import ClonePlan, PlannedPartition
+from .scan import scan_disk
+from .winprep import assess_health
+
+BootCheck = Tuple[bool, str]
+MAX_BAD_SECTOR_LOG = 50
 
 STEPS = [
     "Validar plan",
@@ -42,6 +50,8 @@ STEPS = [
     "Escribir tabla de particiones",
     "Conectar destino y ampliar volúmenes",
     "Configurar arranque",
+    "Convertir a GPT/UEFI",
+    "Comprobar arranque",
     "Finalizar",
 ]
 
@@ -54,6 +64,28 @@ class CloneResult:
     elapsed: float = 0.0
     copied_bytes: int = 0
     warnings: List[str] = field(default_factory=list)
+    bad_sectors: List[int] = field(default_factory=list)   # LBA del origen copiados con ceros
+    boot_checks: List[BootCheck] = field(default_factory=list)
+
+    @property
+    def boot_ok(self) -> bool:
+        return all(ok for ok, _ in self.boot_checks)
+
+
+def fmt_lbas(lbas: List[int]) -> str:
+    """Agrupa LBA consecutivos: ``100-107, 2048``."""
+    out: List[str] = []
+    start = prev = None
+    for lba in sorted(lbas):
+        if start is not None and lba == prev + 1:
+            prev = lba
+            continue
+        if start is not None:
+            out.append(f"{start}" if start == prev else f"{start}-{prev}")
+        start = prev = lba
+    if start is not None:
+        out.append(f"{start}" if start == prev else f"{start}-{prev}")
+    return ", ".join(out)
 
 
 class CloneEngine:
@@ -77,6 +109,8 @@ class CloneEngine:
         self._last_emit = 0.0
         self._copy_t0 = time.monotonic()
         self.warnings: List[str] = []
+        self.bad_sectors: List[int] = []
+        self.boot_checks: List[BootCheck] = []
 
     # ------------------------------------------------------------------
     def log(self, msg: str, level: str = "info"):
@@ -116,6 +150,7 @@ class CloneEngine:
             self.log(f"Destino: {plan.target.title()}")
             if dry:
                 self.log("MODO SIMULACIÓN: no se escribirá nada en ningún disco", "warn")
+            self._log_source_health()
 
             self.step(1)
             if not dry:
@@ -160,7 +195,8 @@ class CloneEngine:
 
             self.step(4)
             self._wipe_tables(dst)
-            copier = Copier(self.cancel, self._on_bytes)
+            copier = Copier(self.cancel, self._on_bytes, skip_bad_sectors=opts.skip_bad_sectors,
+                            on_bad_sector=self._on_bad_sector)
             self._copy_t0 = time.monotonic()
             self._progress(0, self.total, 0.0)
             ss = plan.sector_size
@@ -169,14 +205,18 @@ class CloneEngine:
                 ranges = self.ranges[pp.new_index]
                 self.log(f"Copiando {pp.src.display_name()} ({pp.copy_mode == 'smart' and 'inteligente' or 'sector a sector'}, "
                          f"{fmt_size(sum(l for _, l in ranges))}) → offset {fmt_size(pp.new_start_lba * ss)}")
-                copier.copy(sdev, sbase, dst, pp.new_start_lba * ss, ranges)
+                copier.copy(sdev, sbase, dst, pp.new_start_lba * ss, ranges, lba_base=pp.src.start_lba)
             dst.flush()
+            if self.bad_sectors:
+                self.log(f"{len(self.bad_sectors)} sector(es) ilegibles copiados con ceros: "
+                         + fmt_lbas(self.bad_sectors), "warn")
 
             self.step(5)
             if opts.verify:
                 for pp in plan.parts:
                     sdev, sbase = self._source_for(pp, src)
-                    copier.verify(sdev, sbase, dst, pp.new_start_lba * ss, self.ranges[pp.new_index])
+                    copier.verify(sdev, sbase, dst, pp.new_start_lba * ss, self.ranges[pp.new_index],
+                                  lba_base=pp.src.start_lba)
                     self.log(f"Verificada {pp.src.display_name()}: OK")
             else:
                 self.log("Verificación desactivada")
@@ -214,6 +254,15 @@ class CloneEngine:
             self._configure_boot()
 
             self.step(9)
+            if plan.converts_to_gpt:
+                self._convert_to_gpt()
+            else:
+                self.log("Sin conversión: el destino conserva el estilo " + plan.source.style)
+
+            self.step(10)
+            self._verify_boot()
+
+            self.step(11)
             if opts.retrim:
                 try:
                     self.platform.retrim(plan.target, self.log)
@@ -228,7 +277,14 @@ class CloneEngine:
                 dst = None
                 self.log("Identificadores originales restaurados en el destino; el disco "
                          "queda offline. Retira el disco de origen antes de arrancar.", "warn")
-            return self._finish(True, "Clonación completada correctamente")
+            msg = "Clonación completada correctamente"
+            if not all(ok for ok, _ in self.boot_checks):
+                msg = ("Clonación completada, pero la comprobación del arranque encontró "
+                       "problemas (✗). Revísalos antes de instalar el SSD.")
+                self.log(msg, "warn")
+            if self.bad_sectors:
+                msg += f" · {len(self.bad_sectors)} sector(es) ilegibles se copiaron con ceros."
+            return self._finish(True, msg)
         except CancelledError as e:
             self.log(str(e), "warn")
             return self._finish(False, "Clonación cancelada. El destino no tiene una tabla "
@@ -254,7 +310,29 @@ class CloneEngine:
     def _finish(self, ok: bool, msg: str, cancelled: bool = False) -> CloneResult:
         elapsed = time.monotonic() - self._t0
         self.log(msg, "ok" if ok else ("warn" if cancelled else "error"))
-        return CloneResult(ok, msg, cancelled, elapsed, self.done, list(self.warnings))
+        return CloneResult(ok, msg, cancelled, elapsed, self.done, list(self.warnings),
+                           list(self.bad_sectors), list(self.boot_checks))
+
+    def _on_bad_sector(self, lba: int):
+        self.bad_sectors.append(lba)
+        n = len(self.bad_sectors)
+        if n <= MAX_BAD_SECTOR_LOG:
+            self.log(f"Sector ilegible en el origen, LBA {lba}: se escribieron ceros", "warn")
+        elif n == MAX_BAD_SECTOR_LOG + 1:
+            self.log("Hay más sectores ilegibles; la lista completa aparece al final de la copia", "warn")
+
+    def _log_source_health(self):
+        try:
+            health = self.platform.disk_health(self.plan.source)
+        except Exception as e:
+            self.log(f"No se pudo consultar la salud del origen: {e}", "warn")
+            return
+        level, msgs = assess_health(health)
+        for m in msgs:
+            self.log(f"Salud del origen: {m}", "warn" if level == "danger" else "info")
+        if level == "danger":
+            self.log("El disco de origen muestra signos de fallo: considera activar «Saltar "
+                     "sectores ilegibles» y «Verificar», y respalda primero lo más importante.", "warn")
 
     def _release_snapshots(self):
         for d in self.snap_devices.values():
@@ -354,19 +432,103 @@ class CloneEngine:
             return
         identical = opts.id_mode == "same"
         mapping = self.mounted_devices_mapping(identical)
+        sysp = plan.system_part()
         if identical:
             if mapping:  # sólo MBR con particiones movidas
                 self.platform.remap_mounted_devices(plan.target, win.new_start_lba * ss, mapping, self.log)
             self.log("Modo idéntico: se conserva la configuración de arranque (BCD) original")
-            return
-        if not opts.fix_boot:
+        elif not opts.fix_boot:
             self.log("Reparación de arranque desactivada por el usuario", "warn")
-            return
-        sysp = plan.system_part()
-        if sysp is None:
+        elif sysp is None:
             self.log("No hay partición de sistema; no se puede reparar el arranque", "warn")
+        else:
+            info = win.src.win_info
+            self.platform.make_bootable(plan.target, win.new_start_lba * ss,
+                                        sysp.new_start_lba * ss, plan.firmware, self.log,
+                                        win_build=info.build if info else None)
+            if mapping:
+                self.platform.remap_mounted_devices(plan.target, win.new_start_lba * ss, mapping, self.log)
+        if opts.new_hardware:
+            self.platform.prepare_new_hardware(plan.target, win.new_start_lba * ss, self.log)
+            self.log("Windows preparado para otra computadora. Es posible que Windows y el "
+                     "software con licencia (p. ej. el del plotter) pidan reactivación por el "
+                     "cambio de hardware.", "warn")
+
+    # ------------------------------------------------------------------
+    def _convert_to_gpt(self):
+        """mbr2gpt sobre el destino y MountedDevices de MBR (firma+offset) a GPT (GUID)."""
+        plan, ss = self.plan, self.plan.sector_size
+        try:
+            self.platform.convert_to_gpt(plan.target, self.log)
+        except Exception as e:
+            self.log(f"La conversión a GPT/UEFI falló: {e}", "warn")
+            self.log("El destino sigue siendo MBR y arrancará solo en modo BIOS/Legacy (CSM)", "warn")
+            self.boot_checks.append((False, "Conversión a GPT/UEFI con mbr2gpt"))
             return
-        self.platform.make_bootable(plan.target, win.new_start_lba * ss,
-                                    sysp.new_start_lba * ss, plan.firmware, self.log)
+        self.boot_checks.append((True, "Conversión a GPT/UEFI con mbr2gpt"))
+        win = plan.windows_part()
+        if win is None:
+            return
+        with self.platform.open_disk(plan.target, write=False) as dev:
+            disk = scan_disk(dev, plan.target.number, plan.target.model, compute_usage=False)
+        by_start = {p.start_lba: p for p in disk.partitions}
+        mapping = []
+        for pp in plan.parts:
+            g = by_start.get(pp.new_start_lba)
+            if g is not None and g.unique_guid:
+                mapping.append((struct.pack("<IQ", plan.new_signature or 0, pp.new_start_lba * ss),
+                                b"DMIO:ID:" + uuid.UUID(g.unique_guid).bytes_le))
         if mapping:
             self.platform.remap_mounted_devices(plan.target, win.new_start_lba * ss, mapping, self.log)
+
+    def _verify_boot(self):
+        """Comprueba que el destino puede arrancar. Los fallos son advertencias visibles."""
+        plan, opts, ss = self.plan, self.plan.options, self.plan.sector_size
+        win = plan.windows_part()
+        if win is None:
+            self.log("No hay Windows en el destino: no se comprueba el arranque")
+            return
+        checks: List[BootCheck] = []
+        names = {pp.new_start_lba: pp.src.display_name() for pp in plan.parts}
+        sys_off = None
+        with self.platform.open_disk(plan.target, write=False) as dev:
+            disk = scan_disk(dev, plan.target.number, plan.target.model, compute_usage=False)
+            sector0 = dev.read(0, ss)
+            if disk.style == "MBR":
+                checks.append((sector0[510:512] == b"\x55\xAA", "MBR con firma 55AA"))
+                code = (plan.source.boot_code or b"")[:440].ljust(440, b"\0")
+                checks.append((sector0[:440] == code, "Código de arranque del MBR copiado del origen"))
+                sysp = plan.system_part()
+                actives = [p for p in disk.partitions if p.active]
+                ok = (len(actives) == 1 and sysp is not None
+                      and actives[0].start_lba == sysp.new_start_lba)
+                label = names.get(sysp.new_start_lba, "sistema") if sysp else "sistema"
+                checks.append((ok, f"Una sola partición activa y es la de sistema ({label})"
+                               + ("" if ok else f" — activas encontradas: {len(actives)}")))
+                for p in disk.partitions:
+                    if p.fs not in ("NTFS", "FAT32", "FAT16", "FAT12"):
+                        continue
+                    hs = struct.unpack_from("<I", dev.read(p.start_lba * ss, ss), 0x1C)[0]
+                    want = p.start_lba & 0xFFFFFFFF
+                    checks.append((hs == want, f"Hidden sectors de {names.get(p.start_lba, p.index)}: "
+                                               f"{hs}" + ("" if hs == want else f" (esperado {want})")))
+                if sysp is not None:
+                    sys_off = sysp.new_start_lba * ss
+            elif disk.style == "GPT":
+                efi = [p for p in disk.partitions if p.role == "efi"]
+                checks.append((bool(efi), "Partición del sistema EFI presente"))
+                if efi:
+                    sys_off = efi[0].start_lba * ss
+            else:
+                checks.append((False, "El destino no tiene una tabla de particiones válida"))
+        if sys_off is not None:
+            try:
+                # En modo idéntico el BCD apunta a los IDs originales, que se escriben al final.
+                checks += self.platform.boot_file_checks(plan.target, disk.style, sys_off,
+                                                         win.new_start_lba * ss, self.log,
+                                                         check_bcd=opts.id_mode != "same")
+            except Exception as e:
+                checks.append((False, f"No se pudieron revisar los archivos de arranque: {e}"))
+        self.boot_checks += checks
+        for ok, text in checks:
+            self.log(("✓ " if ok else "✗ ") + text, "ok" if ok else "warn")

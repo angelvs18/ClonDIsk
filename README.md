@@ -17,6 +17,10 @@ Herramienta de escritorio para **clonar un disco HDD a un SSD en Windows 10/11**
 - Escribe la tabla de particiones **al final**, así una cancelación deja el destino vacío y no a medias.
 - Amplía NTFS (`diskpart extend filesystem`), reconstruye el arranque (`bcdboot`, UEFI o BIOS) y actualiza `MountedDevices` del Windows clonado para que siga siendo `C:`.
 - Envía TRIM al SSD, verifica de forma opcional e impide que el equipo se suspenda durante la copia.
+- Detecta la **versión del Windows de origen** y **respalda sus drivers** (`dism /export-driver`, o copia del DriverStore si DISM no puede) en `Documentos\ClonDisk` antes de modificar nada.
+- Revisa la **salud del disco de origen** y tolera **sectores ilegibles**: reintenta y, si lo eliges, los copia con ceros y anota su LBA.
+- Puede **convertir el destino a GPT/UEFI** con `mbr2gpt` y **preparar Windows para otra computadora** (drivers AHCI/NVMe/Intel RST de arranque).
+- Al terminar **comprueba que el destino puede arrancar** y lo muestra con ✓/✗.
 
 ### Modos de identificadores
 
@@ -30,6 +34,14 @@ Herramienta de escritorio para **clonar un disco HDD a un SSD en Windows 10/11**
 - Windows 10 u 11 y **Python 3.10+ de 64 bits**.
 - Permisos de administrador (la app los pide con UAC).
 - Servicio «Instantáneas de volumen» habilitado (viene así por defecto).
+- Para **convertir a GPT/UEFI**: el equipo que ejecuta ClonDisk necesita **Windows 10 1703 (build 15063) o posterior** (trae `mbr2gpt.exe`) y el Windows clonado debe ser Windows 10 o posterior. Si no se cumple, la opción aparece deshabilitada con el motivo.
+
+### Clonar un Windows que no está en ejecución (disco por USB)
+
+- Si el destino es más pequeño, ClonDisk reduce la partición **del disco de origen** con Windows. En un Windows sin conexión, `powercfg /h off` no sirve (afectaría al equipo anfitrión): usa «Preparar volumen para reducir», que borra `hiberfil.sys`, `pagefile.sys`, `swapfile.sys` y las instantáneas de ese volumen. Ese Windows recrea los archivos al arrancar.
+- Si el SSD irá a **otra computadora**, activa la opción correspondiente: evita `INACCESSIBLE_BOOT_DEVICE`. Windows y el software con licencia pueden pedir reactivación.
+- Un origen **MBR** arranca solo en modo **BIOS/Legacy (CSM)**. Para un equipo solo-UEFI elige «Convertir a GPT/UEFI».
+- Los drivers respaldados se reinstalan con `pnputil /add-driver "<carpeta>\*.inf" /subdirs /install`.
 
 ## Instalación
 
@@ -93,7 +105,7 @@ clondisk/
 
 - No admite discos dinámicos (LDM), Espacios de almacenamiento, particiones extendidas o lógicas MBR, ni volúmenes **BitLocker** activos (descífralos antes).
 - El origen y el destino deben tener el **mismo tamaño de sector lógico**. Algunos adaptadores USB presentan el disco como 4Kn; si pasa, conecta el SSD por SATA o M.2, o usa otro adaptador.
-- No convierte MBR a GPT.
+- La conversión MBR → GPT depende de `mbr2gpt` (máximo 3 particiones primarias en el origen). Si falla, el destino queda en MBR y el registro muestra `setupact.log` y `setuperr.log`.
 - Si la partición de recuperación cambia de posición, al arrancar desde el SSD ejecuta `reagentc /disable` y luego `reagentc /enable` para re-registrar WinRE.
 
 ## Pruebas
@@ -112,6 +124,8 @@ Las pruebas crean discos GPT y MBR reales con NTFS y FAT32 y los clonan a destin
 - la consistencia de NTFS con `ntfsresize`;
 - la partición EFI con `fsck.vfat`;
 - el campo *hidden sectors*, la cancelación y la simulación.
+
+Otras pruebas no necesitan herramientas de disco y también corren en Windows: el plan del caso real (HDD MBR de 500 GB a SSD de 120 GB), los sectores ilegibles con un dispositivo falso, la conversión a GPT, la elección de `bcdboot` y la edición de servicios en una colmena simulada.
 
 ## Capturas
 

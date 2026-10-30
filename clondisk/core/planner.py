@@ -37,6 +37,10 @@ class CloneOptions:
     fix_boot: bool = True         # bcdboot + MountedDevices (modo "new")
     retrim: bool = True           # TRIM al final en el destino
     dry_run: bool = False         # simulación sin escribir
+    skip_bad_sectors: bool = False  # sectores ilegibles → ceros (si no, se aborta)
+    backup_drivers: bool = False  # exportar drivers del Windows de origen (asistente)
+    convert_to_gpt: bool = False  # origen MBR → mbr2gpt al terminar (GPT/UEFI)
+    new_hardware: bool = False    # habilitar drivers de almacenamiento de arranque
 
 
 @dataclass
@@ -86,7 +90,16 @@ class ClonePlan:
 
     @property
     def firmware(self) -> str:
+        """Firmware para el que se ejecuta bcdboot (antes de una posible conversión)."""
         return "UEFI" if self.source.style == "GPT" else "BIOS"
+
+    @property
+    def converts_to_gpt(self) -> bool:
+        return self.options.convert_to_gpt and self.source.style == "MBR"
+
+    @property
+    def final_firmware(self) -> str:
+        return "UEFI" if self.converts_to_gpt else self.firmware
 
     def by_src_index(self, index: int) -> Optional[PlannedPartition]:
         for pp in self.parts:
@@ -142,6 +155,18 @@ def default_resizable(disk: Disk) -> Optional[int]:
     return max(cands, key=lambda p: p.sectors).index
 
 
+def shrink_target_bytes(plan: ClonePlan) -> Optional[int]:
+    """Tamaño (bytes, múltiplo de 1 MiB) al que hay que reducir la partición ajustable
+    del origen para que quepa en el destino; ``None`` si no hace falta o no se puede."""
+    if not plan.deficit_sectors or plan.resizable_index is None:
+        return None
+    part = plan.source.partition_by_index(plan.resizable_index)
+    if part is None:
+        return None
+    ss = plan.source.sector_size
+    return ((part.sectors - plan.deficit_sectors) * ss // MiB) * MiB
+
+
 def resizable_candidates(disk: Disk) -> List[Partition]:
     return [p for p in disk.partitions if p.fs == "NTFS" and p.role == "data"]
 
@@ -176,6 +201,11 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
                 "Desactiva BitLocker (descifrado completo) antes de clonar.")
     for prob in source.problems:
         warn(prob)
+    if options.convert_to_gpt and source.style == "MBR":
+        if options.id_mode == "same":
+            err("La conversión a GPT/UEFI requiere el modo «Nuevos identificadores»")
+        elif not options.fix_boot:
+            err("La conversión a GPT/UEFI requiere reconstruir el arranque (bcdboot)")
     if plan.errors:
         return plan
 
@@ -190,6 +220,9 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
         first_pos = align_up(first_usable, align)
     else:
         limit = min(total, 0xFFFFFFFF + 1)
+        if options.convert_to_gpt:
+            # mbr2gpt necesita espacio libre al final para la GPT de respaldo.
+            limit = min(limit, align_down(total, align) - align)
         first_pos = align
         if total > 0xFFFFFFFF + 1:
             warn("El destino supera 2 TiB y el origen es MBR: el espacio por encima "

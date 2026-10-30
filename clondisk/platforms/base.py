@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Tuple
 
 from ..core.device import Device
 from ..core.model import Disk, Partition
+from ..core.winprep import DiskHealth, DriverBackup
 
 LogFn = Callable[[str], None]
 
@@ -13,6 +14,7 @@ class Platform:
     name = "base"
     supports_vss = False
     is_lab = False
+    supports_offline_windows = False   # respaldo de drivers / preparar volumen sin conexión
 
     def list_disks(self) -> List[Disk]:
         raise NotImplementedError
@@ -45,7 +47,7 @@ class Platform:
         log("Ampliar el sistema de archivos no está disponible en esta plataforma")
 
     def make_bootable(self, disk: Disk, windows_offset: int, system_offset: int,
-                      firmware: str, log: LogFn) -> None:
+                      firmware: str, log: LogFn, win_build: Optional[int] = None) -> None:
         log("Reparar el arranque no está disponible en esta plataforma")
 
     def remap_mounted_devices(self, disk: Disk, windows_offset: int,
@@ -54,6 +56,35 @@ class Platform:
 
     def retrim(self, disk: Disk, log: LogFn) -> None:
         pass
+
+    def prepare_new_hardware(self, disk: Disk, windows_offset: int, log: LogFn) -> None:
+        """Habilita los drivers de almacenamiento de arranque del Windows clonado."""
+        log("Preparar Windows para otra computadora no está disponible en esta plataforma")
+
+    def convert_to_gpt(self, disk: Disk, log: LogFn) -> None:
+        raise NotImplementedError("La conversión a GPT/UEFI no está disponible en esta plataforma")
+
+    def boot_file_checks(self, disk: Disk, style: str, system_offset: int, windows_offset: int,
+                         log: LogFn, check_bcd: bool = True) -> List[Tuple[bool, str]]:
+        """Comprobaciones de archivos de arranque (bootmgr, BCD, bcdedit). Lista de (ok, texto)."""
+        log("La revisión de archivos de arranque no está disponible en esta plataforma")
+        return []
+
+    # --- información del anfitrión y del origen ----------------------------
+    def host_build(self) -> Optional[int]:
+        return None
+
+    def has_mbr2gpt(self) -> bool:
+        return False
+
+    def disk_health(self, disk: Disk) -> Optional[DiskHealth]:
+        return None
+
+    def backup_drivers(self, part: Partition, log: LogFn) -> DriverBackup:
+        raise NotImplementedError("El respaldo de drivers no está disponible en esta plataforma")
+
+    def prepare_offline_volume(self, disk: Disk, part: Partition, log: LogFn) -> List[str]:
+        raise NotImplementedError("Preparar el volumen no está disponible en esta plataforma")
 
     def shrink_partition(self, disk: Disk, part: Partition, new_size: int, log: LogFn) -> None:
         raise NotImplementedError("Reducir particiones no está disponible en esta plataforma")

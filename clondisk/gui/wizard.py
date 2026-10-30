@@ -12,8 +12,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QRadioButton, QScrollArea, QSlider, QStackedWidget, QTableWidget,
                                QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget)
 
-from ..core.model import MiB, Disk, fmt_size
-from ..core.planner import CloneOptions, ClonePlan, build_plan, resizable_candidates
+from ..core.model import MiB, Disk, Partition, fmt_size
+from ..core.planner import (CloneOptions, ClonePlan, build_plan, resizable_candidates,
+                            shrink_target_bytes)
+from ..core.winprep import (DriverBackup, assess_health, gpt_conversion_status,
+                            offline_windows, source_windows)
 from . import theme
 from .diskmap import DiskCard, DiskMapWidget, disk_segments, plan_segments
 from .progress import run_in_thread
@@ -66,6 +69,10 @@ class CloneWizard(QDialog):
         self.res_sectors: Optional[int] = None
         self.plan: Optional[ClonePlan] = None
         self._busy = False
+        self.health: dict = {}                      # número de disco → DiskHealth | None
+        self.driver_backup: Optional[DriverBackup] = None
+        self.driver_backup_skipped = False
+        self._opts_source: Optional[int] = None     # origen para el que se fijaron las opciones
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -117,8 +124,11 @@ class CloneWizard(QDialog):
             self._refresh_source_page()
         elif i == 1:
             self._refresh_target_page()
+        elif i == 2:
+            self._refresh_options_page()
         elif i == 3:
             self._rebuild_plan(reset_size=False)
+            self._fetch_health()
         elif i == 4:
             self._refresh_summary()
         self.btn_back.setEnabled(i > 0)
@@ -149,8 +159,97 @@ class CloneWizard(QDialog):
             self._read_options()
         if i < 4:
             self.show_page(i + 1)
-        else:
+        elif self.options.dry_run:
             self.accept()
+        else:
+            self._with_driver_backup(self.accept)
+
+    # ------------------------------------------------------------------ tareas en segundo plano
+    def _run_busy(self, work, on_done):
+        def done(res, err):
+            self._busy = False
+            self.setCursor(Qt.ArrowCursor)
+            self._update_next()
+            on_done(res, err)
+
+        self._busy = True
+        self.setCursor(Qt.WaitCursor)
+        self._update_next()
+        run_in_thread(self, work, on_done=done)
+
+    def _fetch_health(self, then=None):
+        """Consulta (una vez por disco) la salud del origen y vuelve a pintar los avisos."""
+        src = self.source
+        if src is None or src.number in self.health:
+            if then:
+                then()
+            return
+
+        def work():
+            try:
+                return self.platform.disk_health(src)
+            except Exception:
+                return None
+
+        def done(res, _err):
+            self.health[src.number] = res
+            if self.stack.currentIndex() == 3:
+                self._rebuild_plan()
+            elif self.stack.currentIndex() == 4:
+                self._refresh_summary()
+            if then:
+                then()
+
+        self._run_busy(work, done)
+
+    def _health_html(self) -> str:
+        if self.source is None or self.source.number not in self.health:
+            return ""
+        level, msgs = assess_health(self.health[self.source.number])
+        body = "<br>".join(html.escape(m) for m in msgs)
+        if level == "danger":
+            return (f"<b>⚠ ADVERTENCIA: el disco de origen puede estar fallando.</b><br>{body}<br>"
+                    "Respalda primero lo más importante, activa «Saltar sectores ilegibles» y "
+                    "«Verificar», y evita reducir particiones en este disco si no es imprescindible.")
+        return f"<b>Salud del disco de origen:</b> {body}"
+
+    def _with_driver_backup(self, cont):
+        """Respalda los drivers del Windows de origen (una sola vez) y luego ejecuta ``cont``.
+        Si el respaldo falla, el usuario decide si sigue."""
+        part = offline_windows(self.source) if self.source else None
+        if (not self.options.backup_drivers or part is None or self.driver_backup is not None
+                or self.driver_backup_skipped or not self.platform.supports_offline_windows):
+            cont()
+            return
+        notes: List[str] = []
+
+        def work():
+            return self.platform.backup_drivers(part, lambda m, l="info": notes.append(m))
+
+        def done(res, err):
+            if err:
+                r = QMessageBox.question(
+                    self, "Respaldo de drivers",
+                    f"No se pudieron respaldar los drivers de {part.display_name()}:\n\n{err}\n\n"
+                    "¿Quieres continuar sin respaldo de drivers?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if r == QMessageBox.Yes:
+                    self.driver_backup_skipped = True
+                    cont()
+                return
+            self.driver_backup = res
+            how = "DISM /export-driver" if res.method == "dism" else \
+                "copia del DriverStore (DISM no pudo procesar ese Windows)"
+            extra = f"\n\n{len(res.unmatched)} oem*.inf sin carpeta: {', '.join(res.unmatched)}" \
+                if res.unmatched else ""
+            QMessageBox.information(
+                self, "Respaldo de drivers",
+                f"Se respaldaron {res.count} driver(s) de {part.display_name()} mediante {how}.\n\n"
+                f"Carpeta:\n{res.folder}{extra}\n\nPara reinstalarlos: "
+                f"pnputil /add-driver \"{res.folder}\\*.inf\" /subdirs /install")
+            cont()
+
+        self._run_busy(work, done)
 
     # ------------------------------------------------------------------ página 1: origen
     def _build_source_page(self):
@@ -159,7 +258,8 @@ class CloneWizard(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(page_header("Selecciona el disco de origen",
                                   "Es el disco que quieres copiar (por ejemplo, tu HDD actual con Windows). "
-                                  "No se modificará."))
+                                  "Solo se modifica si decides reducir una de sus particiones "
+                                  "para que quepa en el destino."))
         self.src_body = QWidget()
         self.src_layout = QVBoxLayout(self.src_body)
         self.src_layout.setSpacing(10)
@@ -266,10 +366,26 @@ class CloneWizard(QDialog):
         self.chk_smart = QCheckBox("Copia inteligente: copiar solo los sectores en uso de NTFS (mucho más rápido)")
         self.chk_vss = QCheckBox("Usar instantáneas VSS (permite clonar Windows mientras está en uso)")
         self.chk_verify = QCheckBox("Verificar los datos copiados (duplica el tiempo)")
-        for c in (self.chk_smart, self.chk_vss, self.chk_verify):
+        self.lbl_verify_hint = QLabel("Recomendado: el origen contiene Windows; verificar la copia "
+                                      "detecta errores de lectura del HDD o del adaptador USB.")
+        self.chk_skip_bad = QCheckBox("Saltar sectores ilegibles: copiarlos con ceros y anotar su LBA "
+                                      "(si no, la copia se detiene en el primero)")
+        for c in (self.chk_smart, self.chk_vss, self.chk_verify, self.lbl_verify_hint, self.chk_skip_bad):
             l1.addWidget(c)
+        self.lbl_verify_hint.setWordWrap(True)
+        self.lbl_verify_hint.setStyleSheet(f"color:{theme.WARN}; margin-left: 24px;")
         self.chk_vss.setEnabled(self.platform.supports_vss)
         lay.addWidget(g1)
+
+        self.g_win = QGroupBox("Windows de origen")
+        lw = QVBoxLayout(self.g_win)
+        self.lbl_win = QLabel()
+        self.lbl_win.setWordWrap(True)
+        self.chk_drivers = QCheckBox("Respaldar drivers del Windows de origen (en Documentos\\ClonDisk) "
+                                     "antes de reducir o clonar")
+        lw.addWidget(self.lbl_win)
+        lw.addWidget(self.chk_drivers)
+        lay.addWidget(self.g_win)
 
         g2 = QGroupBox("Identificadores del disco y arranque")
         l2 = QVBoxLayout(g2)
@@ -293,12 +409,35 @@ class CloneWizard(QDialog):
             l2.addWidget(x)
         lay.addWidget(g2)
 
+        self.g_fw = QGroupBox("Formato de arranque del destino")
+        lf = QVBoxLayout(self.g_fw)
+        self.rb_keep_mbr = QRadioButton("Igual que el origen (MBR/BIOS)")
+        self.rb_to_gpt = QRadioButton("Convertir a GPT/UEFI (recomendado para equipos modernos)")
+        self.lbl_fw = QLabel()
+        self.lbl_fw.setWordWrap(True)
+        self.lbl_fw.setStyleSheet(f"color:{theme.MUTED}; margin-left: 24px;")
+        grp_fw = QButtonGroup(self)
+        for x in (self.rb_keep_mbr, self.rb_to_gpt):
+            grp_fw.addButton(x)
+        for x in (self.rb_keep_mbr, self.rb_to_gpt, self.lbl_fw):
+            lf.addWidget(x)
+        self.rb_new.toggled.connect(lambda _on: self._update_fw_controls())
+        self.chk_boot.toggled.connect(lambda _on: self._update_fw_controls())
+        lay.addWidget(self.g_fw)
+
         g3 = QGroupBox("Al terminar")
         l3 = QVBoxLayout(g3)
         self.chk_trim = QCheckBox("Enviar TRIM al SSD (optimiza el rendimiento desde el principio)")
         self.chk_dry = QCheckBox("Simulación: analizar y validar todo sin escribir en el destino")
-        l3.addWidget(self.chk_trim)
-        l3.addWidget(self.chk_dry)
+        self.chk_newhw = QCheckBox("El SSD irá a otra computadora (habilitar los drivers de "
+                                   "almacenamiento AHCI, NVMe e Intel RST del Windows clonado)")
+        d3 = QLabel("Evita la pantalla azul INACCESSIBLE_BOOT_DEVICE con otra controladora. Windows y "
+                    "el software con licencia (p. ej. el del plotter) pueden pedir reactivación por "
+                    "el cambio de hardware.")
+        d3.setWordWrap(True)
+        d3.setStyleSheet(f"color:{theme.MUTED}; margin-left: 24px;")
+        for x in (self.chk_trim, self.chk_newhw, d3, self.chk_dry):
+            l3.addWidget(x)
         lay.addWidget(g3)
         lay.addStretch(1)
 
@@ -311,7 +450,59 @@ class CloneWizard(QDialog):
         self.chk_boot.setChecked(o.fix_boot)
         self.chk_trim.setChecked(o.retrim)
         self.chk_dry.setChecked(o.dry_run)
+        self.chk_skip_bad.setChecked(o.skip_bad_sectors)
+        self.chk_newhw.setChecked(o.new_hardware)
+        self.rb_keep_mbr.setChecked(not o.convert_to_gpt)
+        self.rb_to_gpt.setChecked(o.convert_to_gpt)
         return w
+
+    def _conversion_status(self):
+        allowed, reason = gpt_conversion_status(self.source, self.platform.host_build(),
+                                                self.platform.has_mbr2gpt())
+        if allowed and not self.rb_new.isChecked():
+            return False, "Requiere «Nuevos identificadores + reparar arranque»."
+        if allowed and not self.chk_boot.isChecked():
+            return False, "Requiere «Reconstruir el arranque» (bcdboot)."
+        return allowed, reason
+
+    def _update_fw_controls(self):
+        if self.source is None or self.source.style != "MBR":
+            return
+        allowed, reason = self._conversion_status()
+        self.rb_to_gpt.setEnabled(allowed)
+        if not allowed and self.rb_to_gpt.isChecked():
+            self.rb_keep_mbr.setChecked(True)
+        if allowed:
+            self.lbl_fw.setText("Con MBR el SSD arrancará solo en modo BIOS/Legacy (CSM). Al convertir, "
+                                "se ejecuta mbr2gpt al terminar y el SSD arrancará en modo UEFI.")
+        else:
+            self.lbl_fw.setText("Conversión no disponible: " + reason)
+
+    def _refresh_options_page(self):
+        src = self.source
+        if src is None:
+            return
+        win = source_windows(src)
+        offline = offline_windows(src)
+        self.lbl_verify_hint.setVisible(win is not None and not self.chk_verify.isChecked())
+        self.g_win.setVisible(win is not None)
+        if win is not None:
+            info = win.win_info.display() if win.win_info else "versión no detectada"
+            state = "es el Windows en ejecución" if win.is_boot else "no está en ejecución"
+            self.lbl_win.setText(f"<b>{html.escape(win.display_name())}</b>: {html.escape(info)} "
+                                 f"— {state}.")
+        can_backup = offline is not None and self.platform.supports_offline_windows
+        self.chk_drivers.setEnabled(can_backup)
+        if self._opts_source != src.number:
+            # Valor por defecto según el origen; después se respeta lo que elija el usuario.
+            self._opts_source = src.number
+            self.chk_drivers.setChecked(can_backup)
+            self.rb_keep_mbr.setChecked(True)
+            self.driver_backup, self.driver_backup_skipped = None, False
+        if not can_backup:
+            self.chk_drivers.setChecked(False)
+        self.g_fw.setVisible(src.style == "MBR")
+        self._update_fw_controls()
 
     def _read_options(self):
         self.options = CloneOptions(
@@ -322,6 +513,11 @@ class CloneWizard(QDialog):
             fix_boot=self.chk_boot.isChecked(),
             retrim=self.chk_trim.isChecked(),
             dry_run=self.chk_dry.isChecked(),
+            skip_bad_sectors=self.chk_skip_bad.isChecked(),
+            backup_drivers=self.chk_drivers.isChecked() and self.chk_drivers.isEnabled(),
+            convert_to_gpt=(self.source is not None and self.source.style == "MBR"
+                            and self.rb_to_gpt.isChecked() and self.rb_to_gpt.isEnabled()),
+            new_hardware=self.chk_newhw.isChecked(),
         )
 
     # ------------------------------------------------------------------ página 4: particiones
@@ -433,6 +629,10 @@ class CloneWizard(QDialog):
 
         # mensajes
         self._clear(self.msg_box)
+        health = self._health_html()
+        if health:
+            level = assess_health(self.health.get(self.source.number))[0]
+            self.msg_box.addWidget(banner(health, "error" if level == "danger" else "info"))
         for e in p.errors:
             self.msg_box.addWidget(banner("<b>No se puede clonar:</b> " + html.escape(e), "error"))
         for wmsg in p.warnings:
@@ -440,7 +640,8 @@ class CloneWizard(QDialog):
         if p.ok:
             self.msg_box.addWidget(banner(
                 f"Se copiarán aprox. <b>{fmt_size(p.estimated_copy_bytes())}</b>. "
-                f"Arranque: <b>{p.firmware}</b>.", "info"))
+                f"Arranque: <b>{p.final_firmware}</b>"
+                + (" (MBR convertido con mbr2gpt)" if p.converts_to_gpt else "") + ".", "info"))
         self.btn_shrink.setVisible(bool(p.deficit_sectors and p.resizable_index is not None
                                         and not self.platform.is_lab))
 
@@ -490,31 +691,131 @@ class CloneWizard(QDialog):
     def _shrink_source(self):
         p = self.plan
         part = self.source.partition_by_index(p.resizable_index)
-        ss = self.source.sector_size
-        new_size = ((part.sectors - p.deficit_sectors) * ss // MiB) * MiB
-        r = QMessageBox.warning(
-            self, "Reducir partición de origen",
-            f"Para que el origen quepa en el SSD hay que reducir {part.display_name()} de "
-            f"{fmt_size(part.size_bytes(ss))} a {fmt_size(new_size)}.\n\n"
-            "Windows lo hace de forma segura (igual que «Reducir volumen» en Administración de "
-            "discos). Aun así, haz un respaldo de tus datos importantes antes.\n\n¿Continuar?",
-            QMessageBox.Yes | QMessageBox.No)
-        if r != QMessageBox.Yes:
+        new_size = shrink_target_bytes(p)
+        if part is None or new_size is None:
             return
+        # Primero el respaldo de drivers: después se modifica el origen.
+        self._with_driver_backup(lambda: self._shrink_query(part, new_size))
+
+    def _shrink_query(self, part: Partition, new_size: int, note: str = ""):
+        src = self.source
 
         def work():
-            mn = self.platform.min_partition_size(self.source, part)
-            if mn and new_size < mn:
-                raise RuntimeError(
-                    f"Windows solo puede reducir la partición hasta {fmt_size(mn)} por archivos "
-                    "inamovibles. Desactiva temporalmente la hibernación (powercfg /h off), el archivo "
-                    "de paginación y los puntos de restauración, reinicia y vuelve a intentarlo.")
+            mn = self.platform.min_partition_size(src, part)
+            try:
+                health = self.platform.disk_health(src)
+            except Exception:
+                health = None
+            return mn, health
+
+        def done(res, err):
+            if err:
+                QMessageBox.critical(self, "Reducir partición de origen",
+                                     f"No se pudo consultar el tamaño mínimo: {err}")
+                return
+            mn, health = res
+            self.health[src.number] = health
+            self._shrink_dialog(part, new_size, mn, note)
+
+        self._run_busy(work, done)
+
+    def _shrink_dialog(self, part: Partition, new_size: int, mn: Optional[int], note: str = ""):
+        src, ss = self.source, self.source.sector_size
+        e = html.escape
+        name = e(part.display_name())
+        offline = part.has_windows and not part.is_boot
+        too_small = bool(mn and new_size < mn)
+        health = self._health_html()
+        level = assess_health(self.health.get(src.number))[0]
+        rows = [("Tamaño actual", fmt_size(part.size_bytes(ss))),
+                ("Tamaño necesario para caber en el destino", fmt_size(new_size)),
+                ("Mínimo que permite Windows ahora", fmt_size(mn) if mn else "desconocido")]
+        table = "".join(f"<tr><td>{a}</td><td align='right'>&nbsp;&nbsp;<b>{b}</b></td></tr>"
+                        for a, b in rows)
+        text = (f"{note}<p><b>Se va a MODIFICAR la partición {name} del disco de ORIGEN</b> "
+                f"(Disco {src.number}, {e(src.model)}). Haz un respaldo de tus datos importantes "
+                "antes de continuar.</p>"
+                f"<table>{table}</table>")
+        if health:
+            color = theme.DANGER if level == "danger" else theme.MUTED
+            text += f"<p style='color:{color}'>{health}</p>"
+        box = QMessageBox(self)
+        box.setWindowTitle("Reducir partición de origen")
+        box.setTextFormat(Qt.RichText)
+        box.setIcon(QMessageBox.Warning)
+        if too_small and offline:
+            letter = e(part.letter or "?")
+            text += (
+                f"<p><b>Windows no puede reducir {name} hasta el tamaño necesario.</b> Ese Windows "
+                "no está en ejecución, así que comandos como <code>powercfg /h off</code> solo "
+                "afectarían a este equipo, no a él. Lo que suele impedirlo en un Windows sin conexión:</p><ul>"
+                f"<li><code>{letter}:\\hiberfil.sys</code>, <code>{letter}:\\pagefile.sys</code> y "
+                f"<code>{letter}:\\swapfile.sys</code> (ese Windows los vuelve a crear al arrancar);</li>"
+                f"<li>las instantáneas / puntos de restauración de {letter}: "
+                f"(<code>vssadmin delete shadows /for={letter}: /quiet</code>);</li>"
+                f"<li>archivos del sistema al final del volumen: después de limpiar, ejecuta "
+                f"<code>defrag {letter}: /X</code> para consolidar el espacio libre.</li></ul>"
+                "<p>«Preparar volumen para reducir» hace los dos primeros pasos y vuelve a consultar "
+                "el mínimo.</p>")
+            box.setText(text)
+            b_prep = box.addButton("Preparar volumen para reducir…", QMessageBox.AcceptRole)
+            box.addButton("Cerrar", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is b_prep:
+                self._prepare_volume(part, new_size)
+            return
+        if too_small:
+            text += (f"<p><b>Windows solo puede reducir la partición hasta {fmt_size(mn)}</b> por "
+                     "archivos inamovibles. Desactiva temporalmente la hibernación (powercfg /h off), "
+                     "el archivo de paginación y los puntos de restauración, reinicia y vuelve a "
+                     "intentarlo.</p>")
+            box.setText(text)
+            box.addButton("Cerrar", QMessageBox.RejectRole)
+            box.exec()
+            return
+        text += ("<p>Windows lo hace de forma segura (igual que «Reducir volumen» en Administración "
+                 "de discos).</p><p>¿Reducir ahora?</p>")
+        box.setText(text)
+        b_yes = box.addButton("Reducir partición de origen", QMessageBox.AcceptRole)
+        box.addButton("Cancelar", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is b_yes:
+            self._do_shrink(part, new_size)
+
+    def _prepare_volume(self, part: Partition, new_size: int):
+        letter = part.letter or "?"
+        r = QMessageBox.warning(
+            self, "Preparar volumen para reducir",
+            f"Se modificará el volumen {letter}: del disco de ORIGEN (Disco {self.source.number}):\n\n"
+            f"• Se borrarán {letter}:\\hiberfil.sys, {letter}:\\pagefile.sys y {letter}:\\swapfile.sys.\n"
+            f"• Se eliminarán todas las instantáneas y puntos de restauración de {letter}:.\n\n"
+            "Ese Windows recrea esos archivos al arrancar. Si quedó hibernado (o con «inicio rápido»), "
+            "perderá la sesión guardada y arrancará en frío. Los programas, drivers y datos no se tocan.\n\n"
+            "¿Continuar?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        src = self.source
+
+        def work():
+            return self.platform.prepare_offline_volume(src, part, lambda *a: None)
+
+        def done(actions, err):
+            if err:
+                QMessageBox.critical(self, "Preparar volumen", f"No se pudo preparar {letter}: {err}")
+                return
+            note = ("<p><b>Volumen preparado:</b><br>"
+                    + "<br>".join(html.escape(a) for a in actions) + "</p>")
+            self._shrink_query(part, new_size, note)
+
+        self._run_busy(work, done)
+
+    def _do_shrink(self, part: Partition, new_size: int):
+        def work():
             self.platform.shrink_partition(self.source, part, new_size, lambda *a: None)
             return self.platform.list_disks()
 
         def done(disks, err):
-            self._busy = False
-            self.setCursor(Qt.ArrowCursor)
             if err:
                 QMessageBox.critical(self, "No se pudo reducir", str(err))
             else:
@@ -523,10 +824,7 @@ class CloneWizard(QDialog):
                 self.target = next(d for d in disks if d.number == self.target.number)
             self._rebuild_plan(reset_size=True)
 
-        self._busy = True
-        self.setCursor(Qt.WaitCursor)
-        self._update_next()
-        run_in_thread(self, work, on_done=done)
+        self._run_busy(work, done)
 
     # ------------------------------------------------------------------ página 5: resumen
     def _build_summary_page(self):
@@ -550,6 +848,14 @@ class CloneWizard(QDialog):
         o = p.options
         e = html.escape
         ops = []
+        win = source_windows(p.source)
+        if o.backup_drivers and not o.dry_run:
+            if self.driver_backup:
+                ops.append(f"Drivers del Windows de origen ya respaldados ({self.driver_backup.count}) "
+                           f"en <code>{e(self.driver_backup.folder)}</code>")
+            else:
+                ops.append("Respaldar los drivers del Windows de origen en Documentos\\ClonDisk "
+                           "(antes de empezar)")
         ops.append(f"Poner el Disco {p.target.number} offline y borrar su tabla de particiones")
         if o.use_vss:
             ops.append("Crear instantáneas VSS de los volúmenes NTFS montados del origen")
@@ -571,7 +877,14 @@ class CloneWizard(QDialog):
         if p.windows_part():
             if o.id_mode == "new" and o.fix_boot:
                 ops.append(f"Reconstruir el arranque {p.firmware} con bcdboot y actualizar MountedDevices")
-            elif o.id_mode == "same":
+            if o.new_hardware:
+                ops.append("Habilitar storahci, stornvme, iaStorV e iaStorAVC en el Windows clonado "
+                           "(otra computadora)")
+            if p.converts_to_gpt:
+                ops.append("Convertir el destino a GPT/UEFI con mbr2gpt (/validate y /convert)")
+            if not o.dry_run:
+                ops.append("Comprobar el arranque del destino (MBR/EFI, bootmgr, BCD, hidden sectors)")
+            if o.id_mode == "same":
                 ops.append("Restaurar los identificadores originales y dejar el destino offline")
         if o.retrim:
             ops.append("Enviar TRIM al SSD")
@@ -580,12 +893,42 @@ class CloneWizard(QDialog):
         warn_html = "".join(f"<li style='color:{theme.WARN}'>{e(wm)}</li>" for wm in p.warnings)
         dry = (f"<p style='color:{theme.ACCENT}'><b>Modo simulación:</b> no se escribirá nada.</p>"
                if o.dry_run else "")
+        win_html = ""
+        if win is not None:
+            info = win.win_info.display() if win.win_info else "versión no detectada"
+            win_html = f"<br>Windows en {e(win.display_name())}: <b>{e(info)}</b>"
+        health = self._health_html()
+        level = assess_health(self.health.get(p.source.number))[0] if health else "unknown"
+        health_html = (f"<p style='color:{theme.DANGER if level == 'danger' else theme.MUTED}'>{health}</p>"
+                       if health else "")
+        if p.converts_to_gpt:
+            boot_html = ("<p><b>Arranque:</b> UEFI (el destino se convertirá a GPT con mbr2gpt). "
+                         "Si la conversión falla, el SSD quedará en MBR y arrancará solo en modo "
+                         "BIOS/Legacy (CSM).</p>")
+        elif p.source.style == "MBR":
+            boot_html = (f"<p style='color:{theme.WARN}'><b>El SSD arrancará solo en modo BIOS/Legacy "
+                         "(CSM).</b> El equipo donde lo instales debe tener Legacy/CSM habilitado.</p>")
+        else:
+            boot_html = "<p><b>Arranque:</b> UEFI.</p>"
+        extra = []
+        extra.append("Sectores ilegibles: se copiarán con ceros y se listarán sus LBA al terminar."
+                     if o.skip_bad_sectors else
+                     "Sectores ilegibles: la copia se detendrá indicando el LBA del primero.")
+        if win is not None and not o.verify:
+            extra.append("Recomendado: activa «Verificar» en Opciones al clonar un Windows.")
+        if o.new_hardware:
+            extra.append("Windows y el software con licencia (p. ej. el del plotter) pueden pedir "
+                         "reactivación por el cambio de hardware.")
+        extra_html = "".join(f"<li>{e(x)}</li>" for x in extra)
         self.summary.setHtml(f"""
-        <h3>Origen</h3><p>{e(p.source.title())}</p>
+        <h3>Origen</h3><p>{e(p.source.title())}{win_html}</p>
+        {health_html}
         <h3>Destino</h3><p>{e(p.target.title())}<br>
         <span style='color:{theme.DANGER}'><b>Todo su contenido será reemplazado.</b></span></p>
         {dry}
+        {boot_html}
         <h3>Operaciones</h3><ol>{''.join(f'<li>{x}</li>' for x in ops)}</ol>
+        <ul>{extra_html}</ul>
         <p>Datos a copiar: <b>{fmt_size(est)}</b> · Tiempo estimado: <b>~{max(1, round(mins))} min</b>
         (depende de la velocidad del HDD).</p>
         {('<h3>Advertencias</h3><ul>' + warn_html + '</ul>') if warn_html else ''}
@@ -595,6 +938,7 @@ class CloneWizard(QDialog):
         <li>Si aparece la partición de recuperación desactivada, ejecuta
         <code>reagentc /enable</code> como administrador.</li></ul>
         """)
+        self._fetch_health()
         self.confirm.setChecked(False)
         self.confirm.setText(f"Entiendo que se borrará todo el contenido del Disco {p.target.number} "
                              f"({p.target.model})" if not o.dry_run else

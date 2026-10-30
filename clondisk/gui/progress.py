@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QListW
                                QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
                                QTextEdit, QVBoxLayout, QWidget)
 
-from ..core.engine import STEPS, CloneEngine, CloneResult
+from ..core.engine import STEPS, CloneEngine, CloneResult, fmt_lbas
 from ..core.model import fmt_size
 from ..core.planner import ClonePlan
 from . import theme
@@ -152,6 +152,13 @@ class ProgressDialog(QDialog):
         self.banner.setWordWrap(True)
         self.banner.hide()
         lay.addWidget(self.banner)
+        self.checks = QLabel("")
+        self.checks.setObjectName("Card")
+        self.checks.setWordWrap(True)
+        self.checks.setTextFormat(Qt.RichText)
+        self.checks.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.checks.hide()
+        lay.addWidget(self.checks)
 
         self.step_label = QLabel("Preparando…")
         self.step_label.setStyleSheet("font-weight:600;")
@@ -264,14 +271,18 @@ class ProgressDialog(QDialog):
         self.thread.wait()
         self.btn_cancel.setEnabled(False)
         self.btn_close.setEnabled(True)
-        kind = "ok" if result.success else ("warn" if result.cancelled else "error")
+        boot_ok = result.boot_ok
+        kind = ("ok" if boot_ok and not result.bad_sectors else "warn") if result.success else \
+            ("warn" if result.cancelled else "error")
         text = result.message
         if result.success:
             self.bar.setValue(1000)
             self.lbl_pct.setText("100 %")
+            check_step = STEPS.index("Comprobar arranque")
             for i in range(self.steps.count()):
-                self.steps.item(i).setText(f"✓  {STEPS[i]}")
-                self.steps.item(i).setForeground(QColor(theme.OK))
+                bad = i == check_step and not boot_ok
+                self.steps.item(i).setText(f"{'✗' if bad else '✓'}  {STEPS[i]}")
+                self.steps.item(i).setForeground(QColor(theme.WARN if bad else theme.OK))
             text += f"  ·  Tiempo total {fmt_time(result.elapsed)}"
             if result.warnings:
                 text += f"  ·  {len(result.warnings)} advertencia(s), revisa el registro"
@@ -280,7 +291,26 @@ class ProgressDialog(QDialog):
         self.banner.style().unpolish(self.banner)
         self.banner.style().polish(self.banner)
         self.banner.show()
+        self._show_checks(result)
         self.step_label.setText("Terminado" if result.success else "Detenido")
+
+    def _show_checks(self, result: CloneResult):
+        parts = []
+        if result.boot_checks:
+            rows = "".join(
+                f"<div style='color:{theme.OK if ok else theme.DANGER}'>"
+                f"<b>{'✓' if ok else '✗'}</b>&nbsp; {html.escape(text)}</div>"
+                for ok, text in result.boot_checks)
+            title = "Comprobación del arranque" if result.boot_ok else \
+                "Comprobación del arranque — HAY PROBLEMAS, no instales el SSD todavía"
+            parts.append(f"<b>{title}</b>{rows}")
+        if result.bad_sectors:
+            parts.append(f"<b style='color:{theme.WARN}'>{len(result.bad_sectors)} sector(es) "
+                         "ilegibles del origen se copiaron con ceros</b> (LBA): "
+                         f"{html.escape(fmt_lbas(result.bad_sectors))}")
+        if parts:
+            self.checks.setText("<br><br>".join(parts))
+            self.checks.show()
 
     def _ask_cancel(self):
         if not self._running:

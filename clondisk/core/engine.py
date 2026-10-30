@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .copier import CancelledError, Copier, VerifyError
-from .device import Device
+from .device import Device, is_access_denied
 from .fs import FsError, ntfs_used_ranges, patch_hidden_sectors
 from .gpt import GptEntry, build_gpt
 from .mbr import MbrEntry, build_mbr
@@ -39,6 +39,11 @@ from .winprep import assess_health
 
 BootCheck = Tuple[bool, str]
 MAX_BAD_SECTOR_LOG = 50
+VSS_MIN_BYTES = 300 * MiB     # «Reservado para el sistema» y similares: se leen directamente
+
+
+class TargetWriteDenied(RuntimeError):
+    pass
 
 STEPS = [
     "Validar plan",
@@ -155,6 +160,7 @@ class CloneEngine:
             self.step(1)
             if not dry:
                 self.platform.prepare_target(plan.target, self.log)
+                self._probe_target_write()   # antes de crear instantáneas
             self._check_cancel()
 
             self.step(2)
@@ -164,6 +170,10 @@ class CloneEngine:
                     # Solo volúmenes con letra: son los que pueden estar en uso.
                     # Recuperación/EFI no montados se leen directamente del disco.
                     if p.fs != "NTFS" or not p.letter:
+                        continue
+                    if p.size_bytes(plan.sector_size) < VSS_MIN_BYTES:
+                        self.log(f"{p.display_name()} ({fmt_size(p.size_bytes(plan.sector_size))}) "
+                                 "se leerá directamente del disco, sin instantánea")
                         continue
                     try:
                         sid, dev = self.platform.create_snapshot(p, plan.sector_size, self.log)
@@ -289,6 +299,9 @@ class CloneEngine:
             self.log(str(e), "warn")
             return self._finish(False, "Clonación cancelada. El destino no tiene una tabla "
                                 "de particiones válida; puedes volver a intentarlo.", cancelled=True)
+        except TargetWriteDenied as e:
+            self.log(f"ERROR: {e}", "error")
+            return self._finish(False, str(e))
         except (VerifyError, FsError, Exception) as e:
             self.log(f"ERROR: {e}", "error")
             return self._finish(False, f"La clonación falló: {e}")
@@ -304,9 +317,39 @@ class CloneEngine:
                     d.close()
                 except Exception:
                     pass
+            if self.snapshots:
+                self.log(f"Liberando {len(self.snapshots)} instantánea(s) VSS de esta clonación")
             self._release_snapshots()
 
     # ------------------------------------------------------------------
+    def _probe_target_write(self):
+        """Lee el sector 0 del destino y lo reescribe igual: detecta un «acceso denegado»
+        (antivirus, Acceso controlado a carpetas) antes de crear instantáneas o copiar."""
+        plan = self.plan
+        dev = None
+        try:
+            dev = self.platform.open_disk(plan.target, write=True)
+            data = dev.read(0, plan.sector_size)
+            dev.write(0, data)
+            dev.flush()
+            self.log("Escritura de prueba en el destino: OK")
+        except OSError as e:
+            if not is_access_denied(e):
+                raise
+            try:
+                advice = self.platform.write_denied_diagnosis(plan.target)
+            except Exception:
+                advice = ""
+            raise TargetWriteDenied(
+                f"Windows denegó la escritura en el Disco {plan.target.number} ({e}). No se "
+                "crearon instantáneas ni se copió nada; el origen está intacto.\n\n" + advice) from None
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+
     def _finish(self, ok: bool, msg: str, cancelled: bool = False) -> CloneResult:
         elapsed = time.monotonic() - self._t0
         self.log(msg, "ok" if ok else ("warn" if cancelled else "error"))

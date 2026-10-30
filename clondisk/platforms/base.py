@@ -32,6 +32,11 @@ class Platform:
     def bring_online(self, disk: Disk, log: LogFn) -> None:
         pass
 
+    def write_denied_diagnosis(self, disk: Disk) -> str:
+        """Explicación para el usuario cuando el sistema deniega la escritura en el destino."""
+        from ..core.winprep import write_denied_advice
+        return write_denied_advice(None, "")
+
     def set_offline(self, disk: Disk, log: LogFn) -> None:
         pass
 

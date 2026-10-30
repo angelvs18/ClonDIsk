@@ -27,7 +27,8 @@ from ..core.model import Disk, Partition, WindowsInfo, fmt_size
 from ..core.scan import scan_disk
 from ..core.winprep import (DiskHealth, DriverBackup, Hive, bcdedit_partition_letters,
                             choose_bcdboot, count_inf_files, driver_backup_dir,
-                            enable_boot_storage_drivers, match_oem_driver_folders)
+                            enable_boot_storage_drivers, match_oem_driver_folders,
+                            write_denied_advice)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -42,6 +43,7 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 IOCTL_DISK_UPDATE_PROPERTIES = 0x00070140
+IOCTL_DISK_DELETE_DRIVE_LAYOUT = 0x0007C100
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
 FSCTL_LOCK_VOLUME = 0x00090018
@@ -124,7 +126,7 @@ class _K32:
 
 def _winerr(msg: str) -> DeviceError:
     code = ctypes.get_last_error()
-    return DeviceError(f"{msg}: {ctypes.FormatError(code).strip()} (código {code})")
+    return DeviceError(f"{msg}: {ctypes.FormatError(code).strip()} (código {code})", code)
 
 
 class WinDevice(Device):
@@ -668,12 +670,34 @@ if ($pd) {{
             run_ps(f"Set-Disk -Number {n} -IsReadOnly $false")
             log("Se quitó el atributo de solo lectura del destino")
         if not info.get("IsOffline"):
+            # Bloquear y desmontar los volúmenes mientras aún están montados; los handles
+            # quedan abiertos hasta bring_online() para que Windows no los vuelva a montar.
+            self._lock_volumes(disk, log)
             try:
                 run_ps(f"Set-Disk -Number {n} -IsOffline $true")
                 log(f"Disco {n} desconectado (offline) para escritura directa")
             except CommandError as e:
-                log(f"No se pudo poner offline el disco ({e}); se bloquearán sus volúmenes", "warn")
-                self._lock_volumes(disk, log)
+                log(f"No se pudo poner offline el disco ({e}); sus volúmenes siguen bloqueados", "warn")
+        self._delete_layout(disk, log)
+
+    def _delete_layout(self, disk: Disk, log: LogFn):
+        """Borra la tabla de particiones del destino para que Windows no tenga volúmenes en él."""
+        try:
+            with WinDevice(rf"\\.\PhysicalDrive{disk.number}", write=True,
+                           sector_size=disk.sector_size) as dev:
+                dev.ioctl(IOCTL_DISK_DELETE_DRIVE_LAYOUT)
+                dev.ioctl(IOCTL_DISK_UPDATE_PROPERTIES, check=False)
+            log(f"Tabla de particiones del Disco {disk.number} eliminada (IOCTL_DISK_DELETE_DRIVE_LAYOUT)")
+        except DeviceError as e:
+            log(f"No se pudo borrar el layout con IOCTL ({e}); se sobrescribirá al copiar", "warn")
+
+    def write_denied_diagnosis(self, disk: Disk) -> str:
+        try:
+            out = run_ps("(Get-MpPreference).EnableControlledFolderAccess", timeout=60).strip()
+            cfa = int(out.splitlines()[-1]) if out else None
+        except (CommandError, ValueError):
+            cfa = None
+        return write_denied_advice(cfa, sys.executable)
 
     def _lock_volumes(self, disk: Disk, log: LogFn):
         for p in disk.partitions:

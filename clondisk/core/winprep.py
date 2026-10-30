@@ -233,6 +233,30 @@ def enable_boot_storage_drivers(hive: Hive, log: Callable[[str], None] = lambda 
 
 
 # ---------------------------------------------------------------------------
+# Escritura denegada en el destino
+# ---------------------------------------------------------------------------
+def write_denied_advice(controlled_folder_access: Optional[int], exe: str) -> str:
+    """Diagnóstico de un «Acceso denegado (5)» al escribir en el disco destino.
+    ``controlled_folder_access``: valor de Get-MpPreference EnableControlledFolderAccess
+    (0 = desactivado, 1 = activado, 2 = solo auditoría, None = desconocido)."""
+    app = exe or "ClonDisk.exe / python.exe"
+    if controlled_folder_access == 1:
+        return ("El «Acceso controlado a carpetas» de Windows Defender está ACTIVADO y bloquea "
+                "la escritura directa en discos (sectores de arranque) de las aplicaciones que "
+                "no reconoce.\n\nPara permitir ClonDisk: Seguridad de Windows → Protección "
+                "contra virus y amenazas → Administrar la protección contra ransomware → "
+                "Permitir una aplicación mediante Acceso controlado a carpetas → Agregar una "
+                f"aplicación permitida → {app}\n\nO, en PowerShell como administrador:\n"
+                f"Add-MpPreference -ControlledFolderAccessAllowedApplications \"{app}\"\n\n"
+                "Después vuelve a iniciar la clonación (no hace falta reiniciar).")
+    return ("Windows denegó la escritura en el disco destino. Comprueba que ClonDisk se ejecuta "
+            "como administrador y que ningún programa está usando el disco. Si tu antivirus tiene "
+            "protección del MBR o de sectores de arranque (o la BIOS tiene «Boot sector virus "
+            "protection»), desactívala temporalmente o agrega una excepción para "
+            f"{app}.")
+
+
+# ---------------------------------------------------------------------------
 # bcdedit
 # ---------------------------------------------------------------------------
 def bcdedit_partition_letters(output: str) -> Set[str]:

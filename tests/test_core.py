@@ -731,3 +731,115 @@ def test_partition_messages_no_double_colon():
     small = Disk(2, "ssd", "ssd", 40 * GiB)            # ni reduciendo cabe: error con «E:»
     errs = " ".join(build_plan(src, small, CloneOptions()).errors)
     assert "E:" in errs and "E::" not in errs
+
+
+# ---------------------------------------------------------------- acceso denegado y VSS
+from clondisk.core.device import WindowView, is_access_denied  # noqa: E402
+from clondisk.core.winprep import write_denied_advice  # noqa: E402
+
+
+class SparseDisk(Device):
+    """Disco grande «virtual»: ceros salvo lo escrito; sectores ilegibles opcionales."""
+
+    def __init__(self, size, bad=(), deny_write=None):
+        self.size, self.sector_size, self.path = size, 512, "sparse"
+        self.data, self.bad, self.deny_write = [], set(bad), deny_write
+        self.write_calls = 0
+
+    def read(self, off, n):
+        first, last = off // 512, (off + n - 1) // 512
+        if any(first <= b <= last for b in self.bad):
+            raise DeviceError("CRC", code=23)
+        buf = bytearray(n)
+        for o, d in self.data:
+            lo, hi = max(o, off), min(o + len(d), off + n)
+            if lo < hi:
+                buf[lo - off:hi - off] = d[lo - o:hi - o]
+        return bytes(buf)
+
+    def write(self, off, data):
+        self.write_calls += 1
+        if self.deny_write is not None:
+            raise self.deny_write
+        self.data.append((off, bytes(data)))
+
+
+class VssPlatform(RamPlatform):
+    supports_vss = True
+
+    def __init__(self, devs, cfa=None):
+        super().__init__(devs)
+        self.cfa, self.created, self.deleted = cfa, [], []
+
+    def create_snapshot(self, part, sector_size, log):
+        self.created.append(part.letter)
+        src = self.devs[0]
+        return f"snap-{part.letter}", WindowView(src, part.start_lba * 512, part.sectors * 512)
+
+    def delete_snapshot(self, snap_id, log):
+        self.deleted.append(snap_id)
+        log(f"Instantánea {snap_id} eliminada")
+
+    def write_denied_diagnosis(self, disk):
+        return write_denied_advice(self.cfa, r"C:\Apps\ClonDisk.exe")
+
+
+def _vss_setup(dst, bad=()):
+    """Reservado (10 MB, D:) + E: Windows (700 MB) en un disco MBR de 1 GiB."""
+    src = SparseDisk(1024 * MiB)
+    entries = [MbrEntry(0, 0x80, 0x07, 2048, 20480), MbrEntry(1, 0, 0x07, 22528, 1433600)]
+    src.write(0, build_mbr(b"\x33\xC0" + b"\x90" * 438, 0x1234ABCD, entries))
+    for e in entries:
+        src.write(e.start_lba * 512, _fake_ntfs_boot(e.start_lba, e.sectors - 1))
+    sdisk = scan_disk(src, 0, "hdd", compute_usage=False)
+    src.bad = set(bad)
+    sdisk.partitions[0].letter, sdisk.partitions[1].letter = "D", "E"
+    sdisk.partitions[1].has_windows = True
+    plan = build_plan(sdisk, Disk(1, "ssd", "ssd", dst.size),
+                      CloneOptions(smart_copy=False, retrim=False))
+    assert plan.ok and plan.options.use_vss, plan.errors
+    return src, plan
+
+
+@pytest.mark.parametrize("cfa, needle", [
+    (1, "Acceso controlado a carpetas"),
+    (0, "protección del MBR"),
+    (None, "protección del MBR"),
+])
+def test_probe_write_denied_stops_before_vss(cfa, needle):
+    dst = SparseDisk(1024 * MiB, deny_write=DeviceError("Acceso denegado. (código 5)", code=5))
+    src, plan = _vss_setup(dst)
+    plat = VssPlatform({0: src, 1: dst}, cfa=cfa)
+    logs = []
+    res = CloneEngine(plat, plan, log=lambda m, l="info": logs.append(m)).run()
+    assert not res.success and needle in res.message
+    assert "Disco 1" in res.message and "origen está intacto" in res.message
+    assert plat.created == [] and plat.deleted == []        # ni una instantánea
+    assert dst.write_calls == 1                              # solo la escritura de prueba
+    if cfa == 1:
+        assert r"C:\Apps\ClonDisk.exe" in res.message and "Add-MpPreference" in res.message
+
+
+def test_probe_other_write_errors_are_not_access_denied():
+    assert is_access_denied(DeviceError("x", code=5)) and is_access_denied(PermissionError())
+    assert not is_access_denied(DeviceError("x", code=21)) and not is_access_denied(OSError("x"))
+    dst = SparseDisk(1024 * MiB, deny_write=DeviceError("El dispositivo no está listo", code=21))
+    src, plan = _vss_setup(dst)
+    res = CloneEngine(VssPlatform({0: src, 1: dst}), plan, log=lambda *a: None).run()
+    assert not res.success and "no está listo" in res.message
+    assert "Acceso controlado" not in res.message
+
+
+def test_vss_released_on_failure_and_small_partitions_read_directly():
+    dst = SparseDisk(1024 * MiB)
+    src, plan = _vss_setup(dst, bad={22528 + 100})       # E: ilegible al principio
+    plat = VssPlatform({0: src, 1: dst})
+    logs = []
+    res = CloneEngine(plat, plan, log=lambda m, l="info": logs.append((l, m))).run()
+    assert not res.success and "LBA 22628" in res.message
+    assert plat.created == ["E"]                          # D: (10 MB) sin instantánea
+    assert plat.deleted == ["snap-E"]                     # liberada pese al fallo
+    text = [m for _, m in logs]
+    assert any("D:" in m and "sin instantánea" in m for m in text)
+    assert not any(l == "warn" and "D:" in m for l, m in logs)
+    assert any("Liberando 1 instantánea" in m for m in text)

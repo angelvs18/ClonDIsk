@@ -211,6 +211,9 @@ class Hive:
     def delete_key(self, path: str) -> None:  # pragma: no cover - interfaz (recursivo)
         raise NotImplementedError
 
+    def subkeys(self, path: str) -> List[str]:  # pragma: no cover - interfaz
+        raise NotImplementedError
+
 
 def current_control_set(hive: Hive) -> str:
     current = hive.get_value("Select", "Current")
@@ -289,6 +292,162 @@ def pending_update_reasons(software: Optional[Hive], system: Optional[Hive],
                 reasons.append("Session Manager\\PendingFileRenameOperations tiene "
                                "archivos por reemplazar al reiniciar")
     return reasons
+
+
+# ---------------------------------------------------------------------------
+# Red con IP fija (dispositivos conectados directo, p. ej. un plotter por RJ45)
+# ---------------------------------------------------------------------------
+NET_ADAPTER_CLASS = "{4D36E972-E325-11CE-BFC1-08002BE10318}"
+NETWORK_TXT_NAME = "ClonDisk - red anterior.txt"
+NETWORK_PS1_NAME = "ClonDisk-restaurar-red.ps1"
+_IPV4 = re.compile(r"^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$")
+
+
+@dataclass
+class StaticIp:
+    interface: str                         # GUID de la interfaz en Tcpip\Parameters\Interfaces
+    name: str = ""                         # nombre de la conexión («Ethernet 2»), si se conoce
+    addresses: List[str] = field(default_factory=list)
+    masks: List[str] = field(default_factory=list)
+    gateways: List[str] = field(default_factory=list)
+    dns: List[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return self.name or self.interface
+
+    def prefix(self, i: int) -> int:
+        masks = self.masks or ["255.255.255.0"]
+        mask = masks[i] if i < len(masks) else masks[0]
+        return sum(bin(int(octet)).count("1") for octet in mask.split("."))
+
+
+def _ipv4_list(value) -> List[str]:
+    """REG_MULTI_SZ (lista) o REG_SZ con valores separados por comas o espacios."""
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else re.split(r"[,\s]+", str(value))
+    return [str(x).strip() for x in items if _IPV4.match(str(x).strip())]
+
+
+def read_static_ips(hive: Hive) -> List[StaticIp]:
+    """Interfaces con IP fija (EnableDHCP=0) del ControlSet actual de una colmena SYSTEM."""
+    cs = current_control_set(hive)
+    base = f"{cs}\\Services\\Tcpip\\Parameters\\Interfaces"
+    out: List[StaticIp] = []
+    for guid in sorted(hive.subkeys(base), key=str.lower):
+        key = f"{base}\\{guid}"
+        if hive.get_value(key, "EnableDHCP") != 0:
+            continue
+        addrs = [a for a in _ipv4_list(hive.get_value(key, "IPAddress")) if a != "0.0.0.0"]
+        if not addrs:
+            continue
+        name = hive.get_value(f"{cs}\\Control\\Network\\{NET_ADAPTER_CLASS}\\{guid}\\Connection",
+                              "Name")
+        out.append(StaticIp(guid, str(name or ""), addrs,
+                            _ipv4_list(hive.get_value(key, "SubnetMask")),
+                            [g for g in _ipv4_list(hive.get_value(key, "DefaultGateway"))
+                             if g != "0.0.0.0"],
+                            _ipv4_list(hive.get_value(key, "NameServer"))))
+    return out
+
+
+def fmt_static_ip(ip: StaticIp) -> str:
+    addrs = ", ".join(f"{a}/{ip.masks[i] if i < len(ip.masks) else '?'}"
+                      for i, a in enumerate(ip.addresses))
+    text = f"{ip.label}: IP {addrs}"
+    if ip.gateways:
+        text += f" · puerta de enlace {', '.join(ip.gateways)}"
+    if ip.dns:
+        text += f" · DNS {', '.join(ip.dns)}"
+    return text
+
+
+def network_report_text(ips: List[StaticIp], stamp: str) -> str:
+    lines = [f"ClonDisk — configuración de red con IP fija del equipo anterior ({stamp})", "",
+             "El equipo de origen tenía estas tarjetas de red con IP fija. En el equipo nuevo la",
+             "tarjeta es otra, así que Windows no le aplica esa IP. Si un dispositivo se conecta",
+             "directo por cable (p. ej. un plotter por RJ45), pon la misma IP en la tarjeta nueva.", ""]
+    for ip in ips:
+        lines.append(f"Conexión: {ip.label}")
+        lines.append(f"  Interfaz: {ip.interface}")
+        for i, a in enumerate(ip.addresses):
+            mask = ip.masks[i] if i < len(ip.masks) else (ip.masks[0] if ip.masks else "?")
+            lines.append(f"  Dirección IP: {a}   Máscara de subred: {mask}")
+        lines.append(f"  Puerta de enlace: {', '.join(ip.gateways) or '(ninguna)'}")
+        lines.append(f"  DNS: {', '.join(ip.dns) or '(ninguno)'}")
+        lines.append("")
+    lines += ["Cómo aplicarla:",
+              f"  - Automático: clic derecho en «{NETWORK_PS1_NAME}» (en este escritorio) →",
+              "    «Ejecutar con PowerShell», elige la tarjeta nueva y acepta el aviso de administrador.",
+              "  - A mano: Configuración → Red e Internet → Ethernet → Editar asignación de IP → Manual.",
+              "",
+              "Si Windows avisa que la IP ya está asignada a otro adaptador (el anterior, que ahora",
+              "está oculto), puedes continuar; o quítalo en Administrador de dispositivos → Ver →",
+              "Mostrar dispositivos ocultos → Adaptadores de red."]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def restore_network_script(ips: List[StaticIp], stamp: str) -> str:
+    """Script de PowerShell que lista los adaptadores, pide elegir uno y aplica la IP fija."""
+    def arr(values) -> str:
+        return "@(" + ", ".join(_ps_quote(v) for v in values) + ")"
+
+    configs = ",\n".join(
+        f"    @{{ Nombre = {_ps_quote(ip.label)}; IP = {arr(ip.addresses)}; "
+        f"Prefijo = @({', '.join(str(ip.prefix(i)) for i in range(len(ip.addresses)))}); "
+        f"Puerta = {arr(ip.gateways)}; DNS = {arr(ip.dns)} }}" for ip in ips)
+    return f"""# ClonDisk: restaurar la IP fija de la tarjeta de red del equipo anterior ({stamp})
+# Clic derecho -> «Ejecutar con PowerShell». Pide permisos de administrador.
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {{
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    exit
+}}
+$configs = @(
+{configs}
+)
+foreach ($c in $configs) {{
+    Write-Host ""
+    Write-Host ("Configuración anterior «{{0}}»: IP {{1}} · puerta de enlace {{2}} · DNS {{3}}" -f `
+        $c.Nombre, ($c.IP -join ', '), ($c.Puerta -join ', '), ($c.DNS -join ', '))
+    $ads = @(Get-NetAdapter | Sort-Object Name)
+    for ($i = 0; $i -lt $ads.Count; $i++) {{
+        Write-Host ("  {{0}}) {{1}} - {{2}} [{{3}}]" -f ($i + 1), $ads[$i].Name, $ads[$i].InterfaceDescription, $ads[$i].Status)
+    }}
+    $sel = Read-Host "Número del adaptador al que aplicar esta IP (Enter = omitir)"
+    if (-not $sel) {{ continue }}
+    $n = 0
+    if (-not [int]::TryParse($sel, [ref]$n) -or $n -lt 1 -or $n -gt $ads.Count) {{
+        Write-Host "Opción no válida; se omite." -ForegroundColor Yellow
+        continue
+    }}
+    $ad = $ads[$n - 1]
+    try {{
+        Set-NetIPInterface -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -Dhcp Disabled -ErrorAction Stop
+        Get-NetIPAddress -InterfaceIndex $ad.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        Get-NetRoute -InterfaceIndex $ad.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+        for ($k = 0; $k -lt $c.IP.Count; $k++) {{
+            $p = @{{ InterfaceIndex = $ad.ifIndex; IPAddress = $c.IP[$k]; PrefixLength = $c.Prefijo[$k]; AddressFamily = 'IPv4' }}
+            if ($k -eq 0 -and $c.Puerta.Count -gt 0) {{ $p.DefaultGateway = $c.Puerta[0] }}
+            New-NetIPAddress @p -ErrorAction Stop | Out-Null
+        }}
+        if ($c.DNS.Count -gt 0) {{
+            Set-DnsClientServerAddress -InterfaceIndex $ad.ifIndex -ServerAddresses $c.DNS -ErrorAction Stop
+        }}
+        Write-Host "Listo: $($ad.Name) tiene ahora la IP $($c.IP -join ', ')" -ForegroundColor Green
+    }} catch {{
+        Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    }}
+}}
+Read-Host "Pulsa Enter para cerrar"
+""".replace("\n", "\r\n")
 
 
 # ---------------------------------------------------------------------------

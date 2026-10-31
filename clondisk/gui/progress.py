@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel
 from ..core.engine import STEPS, CloneEngine, CloneResult, fmt_lbas
 from ..core.model import fmt_size
 from ..core.planner import ClonePlan
+from ..core.winprep import NETWORK_PS1_NAME, NETWORK_TXT_NAME, fmt_static_ip
 from . import theme
 
 
@@ -352,6 +353,13 @@ class ProgressDialog(QDialog):
             title = "Comprobación del arranque" if result.boot_ok else \
                 "Comprobación del arranque — HAY PROBLEMAS, no instales el SSD todavía"
             parts.append(f"<b>{title}</b>{rows}")
+        if result.static_ips:
+            rows = "".join(f"<div>{html.escape(fmt_static_ip(ip))}</div>" for ip in result.static_ips)
+            parts.append(
+                "<b>Red con IP fija (tarjeta anterior)</b>" + rows
+                + f"<div style='color:{theme.MUTED}'>La tarjeta del equipo nuevo no hereda esta IP. "
+                f"En el escritorio del Windows clonado quedan «{html.escape(NETWORK_TXT_NAME)}» y "
+                f"«{html.escape(NETWORK_PS1_NAME)}» para aplicarla.</div>")
         if result.extra_checks:
             rows = "".join(
                 f"<div style='color:{theme.OK if ok else theme.WARN}'>"

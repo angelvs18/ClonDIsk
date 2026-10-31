@@ -25,12 +25,13 @@ from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
 from ..core.model import Disk, Partition, WindowsInfo, fmt_size
 from ..core.scan import scan_disk
-from ..core.winprep import (CfaStatus, DiskHealth, DriverBackup, Hive, WinreStatus,
-                            bcdboot_warnings, bcdedit_partition_letters, choose_bcdboot,
-                            count_inf_files, driver_backup_dir, enable_boot_storage_drivers,
-                            find_winre_folder, match_oem_driver_folders,
-                            parse_cfa_preference, pending_update_reasons,
-                            winre_status_from_xml, write_denied_advice)
+from ..core.winprep import (NETWORK_PS1_NAME, NETWORK_TXT_NAME, CfaStatus, DiskHealth,
+                            DriverBackup, Hive, StaticIp, WinreStatus, bcdboot_warnings,
+                            bcdedit_partition_letters, choose_bcdboot, count_inf_files,
+                            driver_backup_dir, enable_boot_storage_drivers, find_winre_folder,
+                            match_oem_driver_folders, network_report_text,
+                            parse_cfa_preference, pending_update_reasons, read_static_ips,
+                            restore_network_script, winre_status_from_xml, write_denied_advice)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -329,17 +330,24 @@ class WinregHive(Hive):
         with self._open(path, write=True) as k:
             self.winreg.SetValueEx(k, name, 0, self.winreg.REG_DWORD, int(value))
 
+    def subkeys(self, path: str) -> List[str]:
+        subs = []
+        try:
+            with self._open(path) as k:
+                i = 0
+                while True:
+                    try:
+                        subs.append(self.winreg.EnumKey(k, i))
+                    except OSError:
+                        break
+                    i += 1
+        except OSError:
+            pass
+        return subs
+
     def delete_key(self, path: str) -> None:
         w = self.winreg
-        with self._open(path, write=True) as k:
-            subs = []
-            i = 0
-            while True:
-                try:
-                    subs.append(w.EnumKey(k, i))
-                except OSError:
-                    break
-                i += 1
+        subs = self.subkeys(path)
         for sub in subs:
             self.delete_key(f"{path}\\{sub}")
         parent, _, leaf = path.rpartition("\\")
@@ -1058,6 +1066,31 @@ ConvertTo-Json -InputObject @($out) -Compress
             changes = enable_boot_storage_drivers(WinregHive(root), log)
         if not changes:
             log("Los drivers de almacenamiento de arranque ya estaban habilitados")
+
+    def save_network_config(self, disk: Disk, windows_offset: int,
+                            log: LogFn) -> Optional[List[StaticIp]]:
+        """Lee las IP fijas del Windows clonado y deja en su escritorio público un .txt con
+        los datos y un .ps1 para aplicarlas a la tarjeta de red nueva."""
+        win, win_tmp, _ = self._ensure_letter(disk, windows_offset)
+        try:
+            hive = f"{win}:\\Windows\\System32\\config\\SYSTEM"
+            with self._loaded_hive(hive, "CLONDISK_SYS", log) as root:
+                ips = read_static_ips(WinregHive(root))
+            if ips:
+                desk = f"{win}:\\Users\\Public\\Desktop"
+                os.makedirs(desk, exist_ok=True)
+                stamp = time.strftime("%Y-%m-%d %H:%M")
+                for name, text in ((NETWORK_TXT_NAME, network_report_text(ips, stamp)),
+                                   (NETWORK_PS1_NAME, restore_network_script(ips, stamp))):
+                    # UTF-8 con BOM: Windows PowerShell 5.1 lee sin BOM como ANSI.
+                    with open(os.path.join(desk, name), "w", encoding="utf-8-sig", newline="") as f:
+                        f.write(text)
+                log(f"Escritorio público del Windows clonado: «{NETWORK_TXT_NAME}» y "
+                    f"«{NETWORK_PS1_NAME}»")
+            return ips
+        finally:
+            if win_tmp:
+                self._remove_letter(disk, win, log)
 
     # ------------------------------------------------------------------ MBR → GPT
     def _mbr2gpt_logs(self, max_lines: int = 60) -> List[str]:

@@ -632,6 +632,10 @@ class DictHive(Hive):
         for k in [k for k in self.keys if k == p or k.startswith(p + "\\")]:
             del self.keys[k]
 
+    def subkeys(self, path):
+        p = path.lower() + "\\"
+        return sorted({k[len(p):].split("\\")[0] for k in self.keys if k.startswith(p)})
+
 
 def test_enable_boot_storage_drivers():
     svc1, svc2 = "ControlSet001\\Services\\", "ControlSet002\\Services\\"
@@ -1263,3 +1267,91 @@ def test_engine_warns_when_bootmgr_signed_with_2023_ca():
     eng._check_boot_signature()                       # destino MBR/BIOS: no se revisa
     assert eng.notices == []
     assert "firma no válida" in SECURE_BOOT_HELP
+
+
+# ---------------------------------------------------------------- red con IP fija
+from clondisk.core.winprep import (NETWORK_PS1_NAME, StaticIp, fmt_static_ip,  # noqa: E402
+                                   network_report_text, read_static_ips, restore_network_script)
+
+IFACES = "ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces\\"
+NETCLS = "ControlSet001\\Control\\Network\\{4D36E972-E325-11CE-BFC1-08002BE10318}\\"
+G_PLOTTER = "{6A1B2C3D-0000-4000-8000-00000000AAAA}"
+G_DHCP = "{6A1B2C3D-0000-4000-8000-00000000BBBB}"
+G_EMPTY = "{6A1B2C3D-0000-4000-8000-00000000CCCC}"
+G_OTHER_CS = "{6A1B2C3D-0000-4000-8000-00000000DDDD}"
+
+
+def _net_hive():
+    return DictHive({
+        "Select": {"Current": 1},
+        IFACES + G_PLOTTER: {"EnableDHCP": 0, "IPAddress": ["192.168.10.5", "10.0.0.2"],
+                             "SubnetMask": ["255.255.255.0", "255.0.0.0"],
+                             "DefaultGateway": ["192.168.10.1"], "NameServer": "8.8.8.8,1.1.1.1"},
+        IFACES + G_DHCP: {"EnableDHCP": 1, "IPAddress": ["0.0.0.0"], "DhcpIPAddress": "192.168.1.40"},
+        IFACES + G_EMPTY: {"EnableDHCP": 0, "IPAddress": ["0.0.0.0"]},   # sin IP real
+        NETCLS + G_PLOTTER + "\\Connection": {"Name": "Ethernet Plotter"},
+        "ControlSet002\\Services\\Tcpip\\Parameters\\Interfaces\\" + G_OTHER_CS:
+            {"EnableDHCP": 0, "IPAddress": ["172.16.0.9"]},
+    })
+
+
+def test_read_static_ips_from_system_hive():
+    ips = read_static_ips(_net_hive())
+    assert len(ips) == 1
+    ip = ips[0]
+    assert ip.interface.upper() == G_PLOTTER and ip.label == "Ethernet Plotter"
+    assert ip.addresses == ["192.168.10.5", "10.0.0.2"]
+    assert ip.masks == ["255.255.255.0", "255.0.0.0"] and [ip.prefix(0), ip.prefix(1)] == [24, 8]
+    assert ip.gateways == ["192.168.10.1"] and ip.dns == ["8.8.8.8", "1.1.1.1"]
+    assert "192.168.10.5/255.255.255.0" in fmt_static_ip(ip) and "8.8.8.8" in fmt_static_ip(ip)
+
+
+def test_static_ip_without_name_or_gateway_and_bad_values():
+    hive = DictHive({"Select": {"Current": 1},
+                     IFACES + G_PLOTTER: {"EnableDHCP": 0, "IPAddress": "192.168.0.50",
+                                          "SubnetMask": "255.255.255.0",
+                                          "DefaultGateway": [""], "NameServer": "x; rm -rf"}})
+    ip = read_static_ips(hive)[0]
+    assert ip.label.upper() == G_PLOTTER and ip.gateways == [] and ip.dns == []
+
+
+def test_network_txt_and_ps1_content():
+    ips = read_static_ips(_net_hive())
+    txt = network_report_text(ips, "2026-10-30 10:00")
+    assert "Ethernet Plotter" in txt and "192.168.10.5" in txt and "255.255.255.0" in txt
+    assert "192.168.10.1" in txt and "8.8.8.8, 1.1.1.1" in txt and NETWORK_PS1_NAME in txt
+    assert "\r\n" in txt and "\n" not in txt.replace("\r\n", "")
+    ps1 = restore_network_script(ips, "2026-10-30 10:00")
+    assert "Get-NetAdapter" in ps1 and "Read-Host" in ps1
+    assert "New-NetIPAddress" in ps1 and "Set-DnsClientServerAddress" in ps1
+    assert "IP = @('192.168.10.5', '10.0.0.2'); Prefijo = @(24, 8)" in ps1
+    assert "Puerta = @('192.168.10.1'); DNS = @('8.8.8.8', '1.1.1.1')" in ps1
+    assert "Nombre = 'Ethernet Plotter'" in ps1 and "RunAs" in ps1
+    assert "\n" not in ps1.replace("\r\n", "")
+    # comillas en el nombre de la conexión: no rompen el script
+    odd = restore_network_script([StaticIp("{G}", "Red de O'Brien", ["192.168.1.2"],
+                                           ["255.255.255.0"])], "x")
+    assert "Nombre = 'Red de O''Brien'" in odd and "DNS = @()" in odd
+
+
+@pytest.mark.skipif(not shutil.which("powershell.exe"), reason="sin PowerShell")
+def test_network_ps1_parses_in_powershell(tmp_path):
+    path = tmp_path / NETWORK_PS1_NAME
+    path.write_text(restore_network_script(read_static_ips(_net_hive()), "x"), encoding="utf-8-sig",
+                    newline="")
+    cmd = ("$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+           f"'{path}', [ref]$null, [ref]$e); $e.Count")
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                       capture_output=True, text=True, timeout=120)
+    assert r.stdout.strip() == "0", r.stdout + r.stderr
+
+
+def test_engine_reports_static_ips():
+    class NetPlatform(RamPlatform):
+        def save_network_config(self, disk, windows_offset, log):
+            return read_static_ips(_net_hive())
+
+    plan, _, dst = _ram_clone(True, set())
+    eng = CloneEngine(NetPlatform({1: dst}), plan, log=lambda *a: None)
+    eng._save_network_config()
+    assert [ip.addresses[0] for ip in eng.static_ips] == ["192.168.10.5"]

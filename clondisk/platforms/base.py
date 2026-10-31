@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Tuple
 
 from ..core.device import Device
 from ..core.model import Disk, Partition
-from ..core.winprep import CfaStatus, DiskHealth, DriverBackup, WinreStatus
+from ..core.winprep import CfaStatus, DiskHealth, DriverBackup, StaticIp, WinreStatus
 
 LogFn = Callable[[str], None]
 
@@ -91,6 +91,11 @@ class Platform:
         """Comprobaciones de archivos de arranque (bootmgr, BCD, bcdedit). Lista de (ok, texto)."""
         log("La revisión de archivos de arranque no está disponible en esta plataforma")
         return []
+
+    def save_network_config(self, disk: Disk, windows_offset: int,
+                            log: LogFn) -> Optional[List[StaticIp]]:
+        """IP fijas del Windows clonado (y archivos para restaurarlas). None = no disponible."""
+        return None
 
     def register_winre(self, disk: Disk, windows_offset: int, recovery_offset: Optional[int],
                        log: LogFn) -> Optional[WinreStatus]:

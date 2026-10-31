@@ -36,7 +36,8 @@ from .model import MiB, fmt_size
 from .planner import ClonePlan, PlannedPartition, estimate_minutes, fmt_minutes_range
 from .scan import scan_disk
 from .winprep import (PENDING_UPDATES_WARNING, SECURE_BOOT_2023_WARNING, WINRE_ENABLE_HINT,
-                      WinreStatus, assess_health, classify_boot_signature, winre_check)
+                      StaticIp, WinreStatus, assess_health, classify_boot_signature,
+                      fmt_static_ip, winre_check)
 
 BootCheck = Tuple[bool, str]
 MAX_BAD_SECTOR_LOG = 50
@@ -75,6 +76,7 @@ class CloneResult:
     boot_checks: List[BootCheck] = field(default_factory=list)
     notices: List[str] = field(default_factory=list)       # avisos para la pantalla final
     extra_checks: List[BootCheck] = field(default_factory=list)  # ✓/✗ que no impiden arrancar
+    static_ips: List[StaticIp] = field(default_factory=list)     # IP fijas del Windows clonado
 
     @property
     def boot_ok(self) -> bool:
@@ -122,6 +124,7 @@ class CloneEngine:
         self.boot_checks: List[BootCheck] = []
         self.notices: List[str] = []
         self.extra_checks: List[BootCheck] = []
+        self.static_ips: List[StaticIp] = []
         self._target_touched = False
         self._efi_offset: Optional[int] = None    # partición EFI del destino (tras comprobar)
 
@@ -276,6 +279,7 @@ class CloneEngine:
 
             self.step(8)
             self._configure_boot()
+            self._save_network_config()
 
             self.step(9)
             if plan.converts_to_gpt:
@@ -386,7 +390,7 @@ class CloneEngine:
         self.log(msg, "ok" if ok else ("warn" if cancelled else "error"))
         return CloneResult(ok, msg, cancelled, elapsed, self.done, list(self.warnings),
                            list(self.bad_sectors), list(self.boot_checks), list(self.notices),
-                           list(self.extra_checks))
+                           list(self.extra_checks), list(self.static_ips))
 
     def _on_bad_sector(self, lba: int):
         self.bad_sectors.append(lba)
@@ -576,6 +580,27 @@ class CloneEngine:
             self.log("Windows preparado para otra computadora. Es posible que Windows y el "
                      "software con licencia (p. ej. el del plotter) pidan reactivación por el "
                      "cambio de hardware.", "warn")
+
+    def _save_network_config(self):
+        """IP fijas de la tarjeta de red anterior: otra tarjeta no las hereda."""
+        plan = self.plan
+        win = plan.windows_part()
+        if win is None:
+            return
+        try:
+            ips = self.platform.save_network_config(plan.target, win.new_start_lba * plan.sector_size,
+                                                    self.log)
+        except Exception as e:
+            self.log(f"No se pudo leer la configuración de red del Windows clonado: {e}", "warn")
+            return
+        if ips is None:
+            return
+        if not ips:
+            self.log("El Windows clonado no tiene tarjetas de red con IP fija")
+            return
+        self.static_ips = list(ips)
+        for ip in ips:
+            self.log(f"IP fija de la tarjeta anterior — {fmt_static_ip(ip)}")
 
     # ------------------------------------------------------------------
     def _convert_to_gpt(self):

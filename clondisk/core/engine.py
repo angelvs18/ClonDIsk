@@ -35,7 +35,8 @@ from .mbr import MbrEntry, build_mbr
 from .model import MiB, fmt_size
 from .planner import ClonePlan, PlannedPartition, estimate_minutes, fmt_minutes_range
 from .scan import scan_disk
-from .winprep import PENDING_UPDATES_WARNING, assess_health
+from .winprep import (PENDING_UPDATES_WARNING, WINRE_ENABLE_HINT, WinreStatus, assess_health,
+                      winre_check)
 
 BootCheck = Tuple[bool, str]
 MAX_BAD_SECTOR_LOG = 50
@@ -73,6 +74,7 @@ class CloneResult:
     bad_sectors: List[int] = field(default_factory=list)   # LBA del origen copiados con ceros
     boot_checks: List[BootCheck] = field(default_factory=list)
     notices: List[str] = field(default_factory=list)       # avisos para la pantalla final
+    extra_checks: List[BootCheck] = field(default_factory=list)  # ✓/✗ que no impiden arrancar
 
     @property
     def boot_ok(self) -> bool:
@@ -119,6 +121,7 @@ class CloneEngine:
         self.bad_sectors: List[int] = []
         self.boot_checks: List[BootCheck] = []
         self.notices: List[str] = []
+        self.extra_checks: List[BootCheck] = []
         self._target_touched = False
 
     # ------------------------------------------------------------------
@@ -280,6 +283,7 @@ class CloneEngine:
                 self.log("Sin conversión: el destino conserva el estilo " + plan.source.style)
 
             self.step(10)
+            self._register_winre()
             self._verify_boot()
 
             self.step(11)
@@ -379,7 +383,8 @@ class CloneEngine:
         elapsed = time.monotonic() - self._t0
         self.log(msg, "ok" if ok else ("warn" if cancelled else "error"))
         return CloneResult(ok, msg, cancelled, elapsed, self.done, list(self.warnings),
-                           list(self.bad_sectors), list(self.boot_checks), list(self.notices))
+                           list(self.bad_sectors), list(self.boot_checks), list(self.notices),
+                           list(self.extra_checks))
 
     def _on_bad_sector(self, lba: int):
         self.bad_sectors.append(lba)
@@ -596,6 +601,32 @@ class CloneEngine:
                                 b"DMIO:ID:" + uuid.UUID(g.unique_guid).bytes_le))
         if mapping:
             self.platform.remap_mounted_devices(plan.target, win.new_start_lba * ss, mapping, self.log)
+
+    def _register_winre(self):
+        """Localiza Winre.wim en el destino y registra su ubicación sin conexión. WinRE no se
+        puede habilitar sin conexión: se indica ejecutar «reagentc /enable» al primer arranque."""
+        plan, ss = self.plan, self.plan.sector_size
+        win = plan.windows_part()
+        if win is None:
+            return
+        if plan.options.id_mode == "same":
+            self.log("Modo idéntico: WinRE conserva la configuración del origen")
+            return
+        with self.platform.open_disk(plan.target, write=False) as dev:
+            disk = scan_disk(dev, plan.target.number, plan.target.model, compute_usage=False)
+        rec = next((p for p in disk.partitions if p.role == "recovery"), None)
+        try:
+            st = self.platform.register_winre(plan.target, win.new_start_lba * ss,
+                                              rec.start_lba * ss if rec else None, self.log)
+        except Exception as e:
+            st = WinreStatus(detail=str(e))
+        if st is None:
+            return
+        ok, text = winre_check(st)
+        self.extra_checks.append((ok, text))
+        self.log(("✓ " if ok else "✗ ") + text, "ok" if ok else "warn")
+        if not st.enabled:
+            self.notices.append(WINRE_ENABLE_HINT)
 
     def _verify_boot(self):
         """Comprueba que el destino puede arrancar. Los fallos son advertencias visibles."""

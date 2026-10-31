@@ -1138,3 +1138,79 @@ def test_engine_measures_speed_while_analyzing():
     speed = [m for m in logs if m.startswith("Velocidad de lectura del origen")]
     assert speed and fmt_size(60000 * 512) in speed[0]       # toda la partición (< 256 MB)
     assert any(m.startswith("Tiempo estimado") and "incluye verificar" in m for m in logs)
+
+
+# ---------------------------------------------------------------- WinRE
+from clondisk.core.winprep import (WINRE_ENABLE_HINT, WinreStatus, find_winre_folder,  # noqa: E402
+                                   parse_reagent_xml, winre_check, winre_status_from_xml)
+
+REAGENT_DISABLED = """<?xml version='1.0' encoding='utf-8'?>
+<WindowsRE version="2.0">
+<WinreBCD id="{00000000-0000-0000-0000-000000000000}"/>
+<WinreLocation path="" id="0" offset="0" guid="{00000000-0000-0000-0000-000000000000}"/>
+<ImageLocation path="\\Recovery\\WindowsRE" id="0" offset="250048675840" guid="{9d8c6a3e-1b2c-4d5e-8f90-a1b2c3d4e5f6}"/>
+<InstallState state="0"/>
+</WindowsRE>"""
+
+
+def test_parse_reagent_xml():
+    info = parse_reagent_xml(REAGENT_DISABLED)
+    assert info == {"winre_path": "", "image_path": "\\Recovery\\WindowsRE", "install_state": 0}
+    enabled = REAGENT_DISABLED.replace('state="0"', 'state="1"').replace(
+        '<WinreLocation path=""', '<WinreLocation path="\\Recovery\\WindowsRE"')
+    assert parse_reagent_xml(enabled)["install_state"] == 1
+    assert parse_reagent_xml("") == {"winre_path": "", "image_path": "", "install_state": None}
+
+
+def test_find_winre_folder_prefers_recovery_partition(tmp_path):
+    rec = tmp_path / "R" / "Recovery" / "WindowsRE"
+    sysrec = tmp_path / "W" / "Windows" / "System32" / "Recovery"
+    sysrec.mkdir(parents=True)
+    rec.mkdir(parents=True)
+    cands = [(str(rec), True), (str(sysrec), False)]
+    assert find_winre_folder(cands) == (None, False)
+    (sysrec / "Winre.wim").write_bytes(b"x")
+    assert find_winre_folder(cands) == (str(sysrec), False)
+    (rec / "Winre.wim").write_bytes(b"x")
+    assert find_winre_folder(cands) == (str(rec), True)
+
+
+def test_winre_check_lines():
+    st = winre_status_from_xml("R:\\Recovery\\WindowsRE", True, True, REAGENT_DISABLED)
+    assert st.registered and st.enabled is False
+    ok, text = winre_check(st)
+    assert ok and "WinRE registrado" in text and "partición de recuperación" in text
+    assert not winre_status_from_xml("R:\\x", True, False, REAGENT_DISABLED).registered
+    assert not winre_status_from_xml("R:\\x", True, True, "<WindowsRE/>").registered
+    ok, text = winre_check(WinreStatus())
+    assert not ok and text.startswith("WinRE registrado") and "no se encontró" in text
+    assert "reagentc /enable" in WINRE_ENABLE_HINT
+
+
+def test_engine_registers_winre_with_recovery_partition():
+    class WinrePlatform(RamPlatform):
+        calls = []
+
+        def register_winre(self, disk, windows_offset, recovery_offset, log):
+            self.calls.append((windows_offset, recovery_offset))
+            return winre_status_from_xml("R:\\Recovery\\WindowsRE", True, True, REAGENT_DISABLED)
+
+    src = RamDisk(64 * MiB)
+    entries = [MbrEntry(0, 0x80, 0x07, 2048, 20000), MbrEntry(1, 0, 0x07, 22048, 60000),
+               MbrEntry(2, 0, 0x27, 82048, 20000)]
+    src.write(0, build_mbr(b"\x33\xC0" + b"\x90" * 438, 0x1234ABCD, entries))
+    for e in entries:
+        src.write(e.start_lba * 512, _fake_ntfs_boot(e.start_lba, e.sectors - 1))
+    sdisk = scan_disk(src, 0, "hdd", compute_usage=False)
+    sdisk.partitions[1].has_windows = True
+    dst = RamDisk(64 * MiB)
+    plan = build_plan(sdisk, Disk(1, "ssd", "ssd", dst.size),
+                      CloneOptions(use_vss=False, smart_copy=False, retrim=False))
+    plat = WinrePlatform({0: src, 1: dst})
+    res = CloneEngine(plat, plan, log=lambda *a: None).run()
+    assert res.success, res.message
+    win, rec = plan.parts[1], plan.parts[2]
+    assert plat.calls == [(win.new_start_lba * 512, rec.new_start_lba * 512)]
+    assert res.extra_checks and res.extra_checks[0][0] and "WinRE registrado" in res.extra_checks[0][1]
+    assert WINRE_ENABLE_HINT in res.notices
+    assert res.boot_ok                              # WinRE no cuenta para «puede arrancar»

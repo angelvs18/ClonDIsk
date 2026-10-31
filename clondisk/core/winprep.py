@@ -292,6 +292,75 @@ def pending_update_reasons(software: Optional[Hive], system: Optional[Hive],
 
 
 # ---------------------------------------------------------------------------
+# Entorno de recuperación (WinRE)
+# ---------------------------------------------------------------------------
+# reagentc /enable solo funciona con el Windows en ejecución: sin conexión se puede
+# registrar la ubicación (/setreimage /target), pero WinRE sigue «Disabled» hasta que
+# alguien ejecuta /enable en el primer arranque (Setup lo hace solo durante OOBE).
+WINRE_ENABLE_HINT = ("WinRE queda registrado pero deshabilitado: en el primer arranque ejecuta "
+                     "«reagentc /enable» como administrador y comprueba con «reagentc /info» "
+                     "que diga Enabled.")
+
+
+@dataclass
+class WinreStatus:
+    wim_folder: Optional[str] = None       # carpeta con Winre.wim (None = no se encontró)
+    in_recovery_partition: bool = False
+    registered: bool = False               # ReAgent.xml apunta a una ubicación de WinRE
+    enabled: Optional[bool] = None         # InstallState de ReAgent.xml
+    detail: str = ""
+
+
+def find_winre_folder(candidates: Iterable[Tuple[str, bool]],
+                      exists: Callable[[str], bool] = os.path.exists) -> Tuple[Optional[str], bool]:
+    """Primera carpeta (de ``(carpeta, es_partición_de_recuperación)``) con Winre.wim."""
+    for folder, is_recovery in candidates:
+        if exists(os.path.join(folder, "Winre.wim")):
+            return folder, is_recovery
+    return None, False
+
+
+def parse_reagent_xml(text: str) -> Dict[str, object]:
+    """Datos útiles de ``Windows\\System32\\Recovery\\ReAgent.xml``."""
+    def attr(tag: str, name: str) -> Optional[str]:
+        m = re.search(rf"<{tag}\b[^>]*\b{name}\s*=\s*[\"']([^\"']*)[\"']", text or "", re.IGNORECASE)
+        return m.group(1) if m else None
+
+    state = attr("InstallState", "state")
+    try:
+        install_state = int(state) if state is not None else None
+    except ValueError:
+        install_state = None
+    return {"winre_path": attr("WinreLocation", "path") or "",
+            "image_path": attr("ImageLocation", "path") or "",
+            "install_state": install_state}
+
+
+def winre_status_from_xml(folder: Optional[str], in_recovery: bool, setreimage_ok: bool,
+                          xml_text: Optional[str]) -> WinreStatus:
+    info = parse_reagent_xml(xml_text or "")
+    located = bool(info["winre_path"] or info["image_path"])
+    state = info["install_state"]
+    return WinreStatus(folder, in_recovery, bool(folder) and setreimage_ok and located,
+                       None if state is None else state == 1)
+
+
+def winre_check(st: WinreStatus) -> Tuple[bool, str]:
+    """Línea ✓/✗ «WinRE registrado» para la comprobación final."""
+    if not st.wim_folder:
+        return False, ("WinRE registrado — no se encontró Winre.wim (ni en la partición de "
+                       "recuperación ni en Windows\\System32\\Recovery)"
+                       + (f": {st.detail}" if st.detail else ""))
+    where = "partición de recuperación" if st.in_recovery_partition else "Windows\\System32\\Recovery"
+    if not st.registered:
+        return False, (f"WinRE registrado — Winre.wim está en {where}, pero reagentc no pudo "
+                       "registrarlo" + (f": {st.detail}" if st.detail else ""))
+    state = {True: "Enabled", False: "Disabled hasta el primer arranque",
+             None: "estado desconocido"}[st.enabled]
+    return True, f"WinRE registrado (Winre.wim en {where}; {state})"
+
+
+# ---------------------------------------------------------------------------
 # Acceso controlado a carpetas (Windows Defender)
 # ---------------------------------------------------------------------------
 # EnableControlledFolderAccess: 0 desactivado, 1 activado, 2 auditoría,

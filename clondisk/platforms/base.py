@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Tuple
 
 from ..core.device import Device
 from ..core.model import Disk, Partition
-from ..core.winprep import CfaStatus, DiskHealth, DriverBackup
+from ..core.winprep import CfaStatus, DiskHealth, DriverBackup, WinreStatus
 
 LogFn = Callable[[str], None]
 
@@ -91,6 +91,11 @@ class Platform:
         """Comprobaciones de archivos de arranque (bootmgr, BCD, bcdedit). Lista de (ok, texto)."""
         log("La revisión de archivos de arranque no está disponible en esta plataforma")
         return []
+
+    def register_winre(self, disk: Disk, windows_offset: int, recovery_offset: Optional[int],
+                       log: LogFn) -> Optional[WinreStatus]:
+        """Registra WinRE en el Windows clonado (None = no disponible en esta plataforma)."""
+        return None
 
     # --- información del anfitrión y del origen ----------------------------
     def host_build(self) -> Optional[int]:

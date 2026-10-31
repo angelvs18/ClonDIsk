@@ -352,6 +352,12 @@ class ProgressDialog(QDialog):
             title = "Comprobación del arranque" if result.boot_ok else \
                 "Comprobación del arranque — HAY PROBLEMAS, no instales el SSD todavía"
             parts.append(f"<b>{title}</b>{rows}")
+        if result.extra_checks:
+            rows = "".join(
+                f"<div style='color:{theme.OK if ok else theme.WARN}'>"
+                f"<b>{'✓' if ok else '✗'}</b>&nbsp; {html.escape(text)}</div>"
+                for ok, text in result.extra_checks)
+            parts.append(f"<b>Otras comprobaciones</b>{rows}")
         if result.bad_sectors:
             parts.append(f"<b style='color:{theme.WARN}'>{len(result.bad_sectors)} sector(es) "
                          "ilegibles del origen se copiaron con ceros</b> (LBA): "

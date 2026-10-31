@@ -25,11 +25,12 @@ from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
 from ..core.model import Disk, Partition, WindowsInfo, fmt_size
 from ..core.scan import scan_disk
-from ..core.winprep import (CfaStatus, DiskHealth, DriverBackup, Hive, bcdboot_warnings,
-                            bcdedit_partition_letters, choose_bcdboot, count_inf_files,
-                            driver_backup_dir, enable_boot_storage_drivers,
-                            match_oem_driver_folders, parse_cfa_preference,
-                            pending_update_reasons, write_denied_advice)
+from ..core.winprep import (CfaStatus, DiskHealth, DriverBackup, Hive, WinreStatus,
+                            bcdboot_warnings, bcdedit_partition_letters, choose_bcdboot,
+                            count_inf_files, driver_backup_dir, enable_boot_storage_drivers,
+                            find_winre_folder, match_oem_driver_folders,
+                            parse_cfa_preference, pending_update_reasons,
+                            winre_status_from_xml, write_denied_advice)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -1090,6 +1091,59 @@ ConvertTo-Json -InputObject @($out) -Compress
         self._update_properties(disk)
         run_ps(f"Update-Disk -Number {disk.number}")
         log(f"Disco {disk.number} convertido a GPT")
+
+    # ------------------------------------------------------------------ WinRE
+    def register_winre(self, disk: Disk, windows_offset: int, recovery_offset: Optional[int],
+                       log: LogFn) -> Optional[WinreStatus]:
+        """Busca Winre.wim (partición de recuperación y, si no, Windows\\System32\\Recovery) y
+        registra su ubicación en el Windows clonado con «reagentc /setreimage /target»."""
+        win, win_tmp, _ = self._ensure_letter(disk, windows_offset)
+        rec, rec_tmp = None, False
+        try:
+            if recovery_offset is not None:
+                try:
+                    rec, rec_tmp, _ = self._ensure_letter(disk, recovery_offset)
+                except CommandError as e:
+                    log(f"No se pudo asignar una letra a la partición de recuperación: {e}", "warn")
+            candidates = []
+            if rec:
+                candidates.append((f"{rec}:\\Recovery\\WindowsRE", True))
+            candidates.append((f"{win}:\\Windows\\System32\\Recovery", False))
+            folder, in_rec = find_winre_folder(candidates)
+            if folder is None:
+                return WinreStatus(detail="no existe " + " ni ".join(
+                    os.path.join(c, "Winre.wim") for c, _ in candidates))
+            log(f"Winre.wim encontrado en {folder}")
+            reagentc = os.path.join(_system32(), "ReAgentc.exe")
+            target = f"{win}:\\Windows"
+            detail, set_ok = "", True
+            try:
+                out = run_exe([reagentc, "/setreimage", "/path", folder, "/target", target], timeout=300)
+                log(f"reagentc /setreimage: {out.strip()}")
+            except CommandError as e:
+                set_ok, detail = False, str(e)
+                log(f"reagentc /setreimage falló: {e}", "warn")
+            try:
+                log("reagentc /info: " + run_exe([reagentc, "/info", "/target", target],
+                                                 timeout=300).strip())
+            except CommandError as e:
+                log(f"reagentc /info: {e}")
+            xml_text = None
+            xml_path = f"{win}:\\Windows\\System32\\Recovery\\ReAgent.xml"
+            try:
+                with open(xml_path, "rb") as f:
+                    xml_text = _decode_log(f.read())
+                log(f"ReAgent.xml: {' '.join(xml_text.split())[:600]}")
+            except OSError as e:
+                log(f"No se pudo leer {xml_path}: {e}", "warn")
+            st = winre_status_from_xml(folder, in_rec, set_ok, xml_text)
+            st.detail = detail
+            return st
+        finally:
+            if rec_tmp:
+                self._remove_letter(disk, rec, log)
+            if win_tmp:
+                self._remove_letter(disk, win, log)
 
     # ------------------------------------------------------------------ comprobación del arranque
     def boot_file_checks(self, disk: Disk, style: str, system_offset: int, windows_offset: int,

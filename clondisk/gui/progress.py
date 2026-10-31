@@ -122,6 +122,8 @@ class ProgressDialog(QDialog):
                             | Qt.WindowMinMaxButtonsHint)
         theme.fit_to_screen(self, 900, 640)
         self.setModal(True)
+        self.platform = platform
+        self.plan = plan
         self.result: CloneResult | None = None
         self._running = False
         self._t0 = time.monotonic()
@@ -200,6 +202,12 @@ class ProgressDialog(QDialog):
         self.btn_save = QPushButton("Guardar registro…")
         self.btn_save.clicked.connect(self._save_log)
         btns.addWidget(self.btn_save)
+        self.btn_disconnect = QPushButton("Preparar para desconectar el disco destino")
+        self.btn_disconnect.setToolTip("Escribe la caché de cada volumen, quita todas las letras "
+                                       "del destino y lo deja offline.")
+        self.btn_disconnect.clicked.connect(self._prepare_disconnect)
+        self.btn_disconnect.hide()
+        btns.addWidget(self.btn_disconnect)
         btns.addStretch(1)
         self.btn_cancel = QPushButton("Cancelar")
         self.btn_cancel.setObjectName("Danger")
@@ -301,6 +309,34 @@ class ProgressDialog(QDialog):
         self.banner.show()
         self._show_checks(result)
         self.step_label.setText("Terminado" if result.success else "Detenido")
+        self.btn_disconnect.setVisible(getattr(self.platform, "supports_prepare_disconnect", False)
+                                       and not self.plan.options.dry_run)
+
+    def _prepare_disconnect(self):
+        target = self.plan.target
+
+        def work():
+            return self.platform.prepare_disconnect(target, lambda *a: None)
+
+        def done(lines, err):
+            self.btn_disconnect.setEnabled(True)
+            self.setCursor(Qt.ArrowCursor)
+            for line in lines or []:
+                self._on_log(line, "info")
+            if err:
+                self._on_log(f"No se pudo preparar el Disco {target.number} para desconectarlo: {err}",
+                             "error")
+                QMessageBox.warning(self, "Preparar para desconectar",
+                                    f"No se pudo preparar el Disco {target.number}:\n\n{err}")
+                return
+            self._on_log(f"Disco {target.number}: ya puedes desconectarlo", "ok")
+            QMessageBox.information(self, "Preparar para desconectar",
+                                    f"Ya puedes desconectar el disco (Disco {target.number}, "
+                                    f"{target.model}).")
+
+        self.btn_disconnect.setEnabled(False)
+        self.setCursor(Qt.WaitCursor)
+        run_in_thread(self, work, on_done=done)
 
     def _show_checks(self, result: CloneResult):
         parts = []

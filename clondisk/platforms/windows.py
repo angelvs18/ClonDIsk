@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
@@ -392,10 +392,14 @@ class WindowsPlatform(Platform):
     name = "Windows"
     supports_vss = True
     supports_offline_windows = True
+    supports_prepare_disconnect = True
 
     def __init__(self):
         self._locked_volumes: List[WinDevice] = []
         self._win_info_cache: Dict[tuple, Optional[WindowsInfo]] = {}
+        # Letras que ClonDisk asignó a cada disco destino (número de disco → letras).
+        # Se quitan por letra: mbr2gpt renumera las particiones al crear la EFI.
+        self._assigned_letters: Dict[int, Set[str]] = {}
 
     # ------------------------------------------------------------------
     def list_disks(self) -> List[Disk]:
@@ -806,7 +810,7 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                 run_diskpart([f"select volume {letter}", "extend filesystem"])
             finally:
                 if tmp:
-                    self._remove_letter(disk, pn, letter, log)
+                    self._remove_letter(disk, letter, log)
         sizes = run_ps_json(
             f"$p = Get-Partition -DiskNumber {disk.number} -PartitionNumber {pn}; $v = $p | Get-Volume; "
             "[pscustomobject]@{P=[uint64]$p.Size; V=[uint64]$v.Size} | ConvertTo-Json -Compress")
@@ -834,18 +838,85 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                    f"-AccessPath '{letter}:\\'")
         except CommandError:
             run_diskpart([f"select disk {disk.number}", f"select partition {pn}", f"assign letter={letter}"])
+        self._assigned_letters.setdefault(disk.number, set()).add(letter)
         for _ in range(20):
             if os.path.exists(f"{letter}:\\"):
                 break
             time.sleep(0.5)
         return letter, True, pn
 
-    def _remove_letter(self, disk: Disk, pn: int, letter: str, log: LogFn):
+    def _remove_letter(self, disk: Disk, letter: str, log: LogFn) -> bool:
+        """Quita una letra del disco destino buscándola POR LETRA (no por número de
+        partición, que cambia con mbr2gpt). Solo toca particiones de ``disk``."""
+        letter = letter.upper()[:1]
+        script = f"""
+$p = @(Get-Partition -DiskNumber {disk.number} -ErrorAction SilentlyContinue |
+       Where-Object {{ [string]$_.DriveLetter -eq '{letter}' }})
+if ($p.Count -eq 0) {{ 'ausente' }} else {{
+  try {{ $p[0] | Remove-PartitionAccessPath -AccessPath '{letter}:\\' -ErrorAction Stop; 'quitada' }}
+  catch {{ 'error: ' + $_.Exception.Message }}
+}}
+"""
         try:
-            run_diskpart([f"select disk {disk.number}", f"select partition {pn}",
-                          f"remove letter={letter}"])
+            out = run_ps(script, timeout=120).strip()
         except CommandError as e:
             log(f"No se pudo quitar la letra {letter}: ({e})", "warn")
+            return False
+        removed = out.startswith("quitada") or out.startswith("ausente")
+        if out.startswith("error"):
+            # La letra es de este disco pero Remove-PartitionAccessPath falló: mountvol.
+            try:
+                run_exe([os.path.join(_system32(), "mountvol.exe"), f"{letter}:", "/D"])
+                removed = True
+            except CommandError as e:
+                log(f"No se pudo quitar la letra {letter}: ({out[7:]}; mountvol: {e})", "warn")
+        if removed:
+            self._assigned_letters.get(disk.number, set()).discard(letter)
+            if out.startswith("ausente"):
+                log(f"Letra temporal {letter}: ya no estaba asignada en el Disco {disk.number}")
+        return removed
+
+    def release_target_letters(self, disk: Disk, log: LogFn) -> List[str]:
+        """Quita todas las letras que ClonDisk asignó al destino. Devuelve las que quedan."""
+        pending = sorted(self._assigned_letters.get(disk.number, set()))
+        for letter in pending:
+            self._remove_letter(disk, letter, log)
+        left = sorted(self._assigned_letters.get(disk.number, set()))
+        if pending and not left:
+            log(f"Letras temporales quitadas del destino: {', '.join(l + ':' for l in pending)}")
+        return left
+
+    def prepare_disconnect(self, disk: Disk, log: LogFn) -> List[str]:
+        """Vacía la caché de escritura de cada volumen, quita todas las letras del disco y
+        lo deja offline para poder retirarlo sin que Windows diga que está en uso."""
+        n = disk.number
+        script = f"""
+$d = Get-Disk -Number {n}
+if ($d.IsBoot -or $d.IsSystem) {{ throw 'El Disco {n} es el disco del sistema en ejecución' }}
+$out = @()
+foreach ($p in @(Get-Partition -DiskNumber {n} -ErrorAction SilentlyContinue)) {{
+  $v = $null
+  try {{ $v = $p | Get-Volume -ErrorAction Stop }} catch {{}}
+  $name = "partición $($p.PartitionNumber)"
+  if ($v) {{
+    try {{ $v | Write-VolumeCache -ErrorAction Stop; $out += "Caché escrita: $name" }}
+    catch {{ $out += "Caché de $name`: $($_.Exception.Message)" }}
+  }}
+  $l = [string]$p.DriveLetter
+  if ($l -and [int][char]$l -ne 0) {{
+    try {{ $p | Remove-PartitionAccessPath -AccessPath "$($l):\\" -ErrorAction Stop; $out += "Letra $($l): quitada" }}
+    catch {{ $out += "Letra $($l): no se pudo quitar: $($_.Exception.Message)" }}
+  }}
+}}
+if (-not $d.IsOffline) {{ Set-Disk -Number {n} -IsOffline $true; $out += 'Disco {n} offline' }}
+else {{ $out += 'Disco {n} ya estaba offline' }}
+ConvertTo-Json -InputObject @($out) -Compress
+"""
+        lines = [str(x) for x in (run_ps_json(script, timeout=300) or [])]
+        self._assigned_letters.pop(n, None)
+        for line in lines:
+            log(line)
+        return lines
 
     def make_bootable(self, disk: Disk, windows_offset: int, system_offset: int,
                       firmware: str, log: LogFn, win_build: Optional[int] = None) -> None:
@@ -875,9 +946,9 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
             log(f"bcdboot: {out.strip()}")
         finally:
             if sys_tmp:
-                self._remove_letter(disk, sys_pn, sysl, log)
+                self._remove_letter(disk, sysl, log)
             if win_tmp:
-                self._remove_letter(disk, win_pn, win, log)
+                self._remove_letter(disk, win, log)
 
     @contextlib.contextmanager
     def _loaded_hive(self, hive_file: str, hive_name: str, log: LogFn):
@@ -910,7 +981,7 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                 yield root
         finally:
             if win_tmp:
-                self._remove_letter(disk, win_pn, win, log)
+                self._remove_letter(disk, win, log)
 
     def remap_mounted_devices(self, disk: Disk, windows_offset: int,
                               mapping: List[Tuple[bytes, bytes]], log: LogFn) -> None:
@@ -1003,9 +1074,9 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                     checks.append((False, f"bcdedit no pudo leer el BCD: {e}"))
         finally:
             if win_tmp:
-                self._remove_letter(disk, win_pn, win, log)
+                self._remove_letter(disk, win, log)
             if sys_tmp:
-                self._remove_letter(disk, sys_pn, sysl, log)
+                self._remove_letter(disk, sysl, log)
         return checks
 
     def retrim(self, disk: Disk, log: LogFn) -> None:

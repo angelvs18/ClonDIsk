@@ -856,3 +856,120 @@ def test_vss_released_on_failure_and_small_partitions_read_directly():
     assert any("D:" in m and "sin instantánea" in m for m in text)
     assert not any(l == "warn" and "D:" in m for l, m in logs)
     assert any("Liberando 1 instantánea" in m for m in text)
+
+
+# ---------------------------------------------------------------- letras temporales del destino
+import re  # noqa: E402
+
+from clondisk.platforms import windows as winplat  # noqa: E402
+
+
+class FakeDiskPS:
+    """Simula Get-Partition/Add-/Remove-PartitionAccessPath y mountvol sobre el disco destino.
+    ``parts``: número de partición → [offset, letra]."""
+
+    def __init__(self, parts, fail_remove=False):
+        self.parts = {n: list(v) for n, v in parts.items()}
+        self.fail_remove = fail_remove
+        self.scripts, self.exes = [], []
+
+    def renumber_like_mbr2gpt(self, efi_offset):
+        """mbr2gpt crea la partición EFI y renumera las demás."""
+        rows = sorted(self.parts.values()) + [[efi_offset, None]]
+        self.parts = {i: r for i, r in enumerate(sorted(rows), 1)}
+
+    def letter_of(self, offset):
+        return next(l for o, l in self.parts.values() if o == offset)
+
+    def run_ps(self, script, timeout=600):
+        self.scripts.append(script)
+        m = re.search(r"\$_\.Offset -eq (\d+)", script)
+        if m:
+            return "".join(f"{n}\n" for n, (o, _) in self.parts.items() if o == int(m.group(1)))
+        m = re.search(r"-PartitionNumber (\d+)\)\.DriveLetter", script)
+        if m:
+            return self.parts[int(m.group(1))][1] or ""
+        m = re.search(r"Add-PartitionAccessPath .*-PartitionNumber (\d+) -AccessPath '(\w):", script)
+        if m:
+            self.parts[int(m.group(1))][1] = m.group(2)
+            return ""
+        m = re.search(r"DriveLetter -eq '(\w)'", script)
+        assert m, script
+        row = next((r for r in self.parts.values() if r[1] == m.group(1)), None)
+        if row is None:
+            return "ausente\n"
+        if self.fail_remove:
+            return "error: Acceso denegado\n"
+        row[1] = None
+        return "quitada\n"
+
+    def run_exe(self, args, timeout=600):
+        self.exes.append(args)
+        assert os.path.basename(args[0]).lower() == "mountvol.exe" and args[2] == "/D"
+        for row in self.parts.values():
+            if row[1] == args[1][0]:
+                row[1] = None
+        return ""
+
+
+@pytest.fixture
+def fake_ps(monkeypatch):
+    def make(parts, **kw):
+        fake = FakeDiskPS(parts, **kw)
+        monkeypatch.setattr(winplat, "run_ps", fake.run_ps)
+        monkeypatch.setattr(winplat, "run_exe", fake.run_exe)
+        monkeypatch.setattr(winplat.time, "sleep", lambda s: None)
+        return fake
+    return make
+
+
+def _win_platform(free="Z"):
+    plat = winplat.WindowsPlatform()
+    plat._free_letter = lambda: free
+    return plat
+
+
+def test_temp_letter_removed_by_letter_after_mbr2gpt_renumbering(fake_ps):
+    win_off = 206848 * 512
+    fake = fake_ps({1: [1048576, None], 2: [win_off, None], 3: [500 * GiB, None]})
+    plat, disk = _win_platform(), real_target()
+    letter, assigned, pn = plat._ensure_letter(disk, win_off)
+    assert (letter, assigned, pn) == ("Z", True, 2)
+    assert plat._assigned_letters[disk.number] == {"Z"}
+    fake.renumber_like_mbr2gpt(efi_offset=3 * MiB)          # Windows pasa a ser la partición 3
+    assert fake.parts[2][0] != win_off and fake.letter_of(win_off) == "Z"
+    logs = []
+    assert plat.release_target_letters(disk, lambda m, l="info": logs.append((l, m))) == []
+    assert fake.letter_of(win_off) is None
+    assert all(l is None for _, l in fake.parts.values())
+    removal = [s for s in fake.scripts if "Remove-PartitionAccessPath" in s]
+    assert removal and all("PartitionNumber" not in s and f"-DiskNumber {disk.number}" in s
+                           for s in removal)
+    assert not any(l == "warn" for l, _ in logs)
+    assert any("Z:" in m for _, m in logs)
+
+
+def test_temp_letter_fallback_to_mountvol_and_letters_of_other_disks_untouched(fake_ps):
+    fake = fake_ps({1: [1048576, "Y"]}, fail_remove=True)
+    plat, disk = _win_platform(), real_target()
+    plat._assigned_letters[disk.number] = {"Y", "W"}          # W: ya no está en este disco
+    assert plat.release_target_letters(disk, lambda *a: None) == []
+    assert fake.parts[1][1] is None
+    assert [a[1] for a in fake.exes] == ["Y:"]                # mountvol solo para Y:
+
+
+def test_engine_releases_letters_even_on_failure():
+    class LetterPlatform(VssPlatform):
+        released = 0
+
+        def release_target_letters(self, disk, log):
+            self.released += 1
+            return ["Z"]
+
+    dst = SparseDisk(1024 * MiB)
+    src, plan = _vss_setup(dst, bad={22528 + 100})
+    plat = LetterPlatform({0: src, 1: dst})
+    logs = []
+    res = CloneEngine(plat, plan, log=lambda m, l="info": logs.append((l, m))).run()
+    assert not res.success and plat.released == 1
+    assert any(l == "warn" and "Z:" in m for l, m in logs)

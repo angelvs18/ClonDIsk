@@ -116,6 +116,7 @@ class CloneEngine:
         self.warnings: List[str] = []
         self.bad_sectors: List[int] = []
         self.boot_checks: List[BootCheck] = []
+        self._target_touched = False
 
     # ------------------------------------------------------------------
     def log(self, msg: str, level: str = "info"):
@@ -159,6 +160,7 @@ class CloneEngine:
 
             self.step(1)
             if not dry:
+                self._target_touched = True
                 self.platform.prepare_target(plan.target, self.log)
                 self._probe_target_write()   # antes de crear instantáneas
             self._check_cancel()
@@ -278,6 +280,7 @@ class CloneEngine:
                     self.platform.retrim(plan.target, self.log)
                 except Exception as e:
                     self.log(f"TRIM no disponible: {e}", "warn")
+            self._release_letters()
             if identical:
                 self.platform.set_offline(plan.target, self.log)
                 dst = self.platform.open_disk(plan.target, write=True)
@@ -320,6 +323,20 @@ class CloneEngine:
             if self.snapshots:
                 self.log(f"Liberando {len(self.snapshots)} instantánea(s) VSS de esta clonación")
             self._release_snapshots()
+            if self._target_touched:
+                self._release_letters()
+
+    def _release_letters(self):
+        """El destino no debe quedar con letras asignadas por ClonDisk."""
+        try:
+            left = self.platform.release_target_letters(self.plan.target, self.log)
+        except Exception as e:
+            self.log(f"No se pudieron quitar las letras temporales del destino: {e}", "warn")
+            return
+        if left:
+            self.log("Quedaron letras asignadas por ClonDisk en el destino: "
+                     + ", ".join(f"{l}:" for l in left) + ". Quítalas en Administración de "
+                     "discos o con «Preparar para desconectar el disco destino».", "warn")
 
     # ------------------------------------------------------------------
     def _probe_target_write(self):

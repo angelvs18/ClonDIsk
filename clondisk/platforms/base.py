@@ -40,6 +40,16 @@ class Platform:
     def set_offline(self, disk: Disk, log: LogFn) -> None:
         pass
 
+    def release_target_letters(self, disk: Disk, log: LogFn) -> List[str]:
+        """Quita las letras temporales que se asignaron al destino. Devuelve las que quedan."""
+        return []
+
+    supports_prepare_disconnect = False
+
+    def prepare_disconnect(self, disk: Disk, log: LogFn) -> List[str]:
+        """Vacía cachés, quita las letras y deja el disco offline para retirarlo."""
+        raise NotImplementedError("Preparar para desconectar no está disponible en esta plataforma")
+
     # --- instantáneas -------------------------------------------------------
     def create_snapshot(self, part: Partition, sector_size: int, log: LogFn) -> Tuple[str, Device]:
         raise NotImplementedError

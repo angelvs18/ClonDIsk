@@ -249,6 +249,49 @@ def enable_boot_storage_drivers(hive: Hive, log: Callable[[str], None] = lambda 
 
 
 # ---------------------------------------------------------------------------
+# Actualizaciones pendientes en el Windows de origen
+# ---------------------------------------------------------------------------
+PENDING_UPDATES_WARNING = (
+    "El Windows de origen tiene actualizaciones pendientes. El primer arranque puede quedarse "
+    "en negro o mostrar «Deshaciendo cambios»; no lo apagues. Lo ideal es arrancar el origen "
+    "una vez en su equipo para terminar las actualizaciones antes de clonar.")
+
+_CBS = "Microsoft\\Windows\\CurrentVersion\\Component Based Servicing"
+_PENDING_SOFTWARE_KEYS = [
+    (_CBS + "\\RebootPending", "Component Based Servicing\\RebootPending"),
+    (_CBS + "\\SessionsPending", "Component Based Servicing\\SessionsPending"),
+    ("Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired",
+     "WindowsUpdate\\Auto Update\\RebootRequired"),
+]
+
+
+def pending_update_reasons(software: Optional[Hive], system: Optional[Hive],
+                           windows_dir: Optional[str]) -> List[str]:
+    """Indicios de actualizaciones a medio instalar. ``software``/``system``: colmenas del
+    Windows de origen (rutas relativas a su raíz); ``windows_dir``: su carpeta Windows."""
+    reasons: List[str] = []
+    if windows_dir and os.path.exists(os.path.join(windows_dir, "WinSxS", "pending.xml")):
+        reasons.append("existe Windows\\WinSxS\\pending.xml")
+    if software is not None:
+        for key, label in _PENDING_SOFTWARE_KEYS:
+            if software.key_exists(key):
+                reasons.append(f"existe la clave {label}")
+    if system is not None:
+        try:
+            cs = current_control_set(system)
+        except ValueError:
+            cs = None
+        if cs:
+            ops = system.get_value(f"{cs}\\Control\\Session Manager", "PendingFileRenameOperations")
+            if isinstance(ops, str):
+                ops = [ops]
+            if ops and any(str(o).strip() for o in ops):
+                reasons.append("Session Manager\\PendingFileRenameOperations tiene "
+                               "archivos por reemplazar al reiniciar")
+    return reasons
+
+
+# ---------------------------------------------------------------------------
 # Acceso controlado a carpetas (Windows Defender)
 # ---------------------------------------------------------------------------
 # EnableControlledFolderAccess: 0 desactivado, 1 activado, 2 auditoría,

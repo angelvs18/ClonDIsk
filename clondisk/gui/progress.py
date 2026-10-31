@@ -340,6 +340,10 @@ class ProgressDialog(QDialog):
 
     def _show_checks(self, result: CloneResult):
         parts = []
+        if result.notices:
+            rows = "".join(f"<div style='color:{theme.WARN}'>⚠&nbsp; {html.escape(n)}</div>"
+                           for n in result.notices)
+            parts.append(f"<b>Avisos</b>{rows}")
         if result.boot_checks:
             rows = "".join(
                 f"<div style='color:{theme.OK if ok else theme.DANGER}'>"

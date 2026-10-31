@@ -16,8 +16,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, resizable_candidates,
                             shrink_target_bytes)
-from ..core.winprep import (CfaStatus, DriverBackup, assess_health, cfa_banner_text,
-                            gpt_conversion_status, offline_windows, source_windows)
+from ..core.winprep import (PENDING_UPDATES_WARNING, CfaStatus, DriverBackup, assess_health,
+                            cfa_banner_text, gpt_conversion_status, offline_windows,
+                            source_windows)
 from . import theme
 from .diskmap import DiskCard, DiskMapWidget, disk_segments, plan_segments
 from .progress import run_in_thread
@@ -120,6 +121,7 @@ class CloneWizard(QDialog):
         self._opts_source: Optional[int] = None     # origen para el que se fijaron las opciones
         self.cfa: Optional[CfaStatus] = None        # Acceso controlado a carpetas
         self.cfa_checked = False
+        self.pending: dict = {}                     # número de disco → actualizaciones pendientes
         self.cfa_override = False                   # el usuario confirmó seguir sin permitirlo
         self._preflight_running = False
 
@@ -272,7 +274,7 @@ class CloneWizard(QDialog):
             if self.stack.currentIndex() == 3:
                 self._rebuild_plan()
             elif self.stack.currentIndex() == 4:
-                self._refresh_summary()
+                self._refresh_summary(keep_confirm=True)
             if then:
                 then()
 
@@ -283,21 +285,45 @@ class CloneWizard(QDialog):
         return bool(self.cfa and self.cfa.blocks and not self.cfa_override)
 
     def _fetch_preflight(self):
-        """Antes de clonar: ¿bloqueará el Acceso controlado a carpetas la escritura?"""
-        if self.cfa_checked or self._preflight_running:
+        """Antes de clonar: ¿bloqueará el Acceso controlado a carpetas la escritura? ¿Tiene
+        el Windows de origen actualizaciones pendientes?"""
+        src = self.source
+        win = source_windows(src) if src else None
+        need_cfa = not self.cfa_checked
+        need_pending = win is not None and src.number not in self.pending
+        if self._preflight_running or not (need_cfa or need_pending):
             return
         self._preflight_running = True
 
         def work():
-            return self.platform.controlled_folder_access()
+            cfa = pend = None
+            if need_cfa:
+                try:
+                    cfa = self.platform.controlled_folder_access()
+                except Exception:
+                    cfa = None
+            if need_pending:
+                try:
+                    pend = self.platform.pending_updates(win)
+                except Exception:
+                    pend = None
+            return cfa, pend
 
-        def done(res, err):
+        def done(res, _err):
             self._preflight_running = False
-            self.cfa_checked = True
-            self.cfa = None if err else res
+            cfa, pend = res or (None, None)
+            if need_cfa:
+                self.cfa_checked, self.cfa = True, cfa
+            if need_pending:
+                self.pending[src.number] = pend
+                if pend and self.stack.currentIndex() == 4:
+                    self._refresh_summary(keep_confirm=True)
             self._update_cfa_box()
 
         self._run_busy(work, done)
+
+    def _pending_reasons(self) -> List[str]:
+        return (self.pending.get(self.source.number) or []) if self.source else []
 
     def _update_cfa_box(self):
         st = self.cfa
@@ -1013,7 +1039,7 @@ class CloneWizard(QDialog):
         lay.addWidget(self.confirm)
         return w
 
-    def _refresh_summary(self):
+    def _refresh_summary(self, keep_confirm: bool = False):
         p = self.plan
         if p is None:
             return
@@ -1064,6 +1090,10 @@ class CloneWizard(QDialog):
         est = p.estimated_copy_bytes()
         mins = est / (110 * MiB) / 60
         warn_html = "".join(f"<li style='color:{theme.WARN}'>{e(wm)}</li>" for wm in p.warnings)
+        pending = self._pending_reasons()
+        if pending:
+            warn_html = (f"<li style='color:{theme.WARN}'><b>{e(PENDING_UPDATES_WARNING)}</b><br>"
+                         f"Detectado: {e('; '.join(pending))}.</li>") + warn_html
         dry = (f"<p style='color:{theme.ACCENT}'><b>Modo simulación:</b> no se escribirá nada.</p>"
                if o.dry_run else "")
         win_html = ""
@@ -1111,7 +1141,8 @@ class CloneWizard(QDialog):
         <li>Si aparece la partición de recuperación desactivada, ejecuta
         <code>reagentc /enable</code> como administrador.</li></ul>
         """)
-        self.confirm.setChecked(False)
+        if not keep_confirm:
+            self.confirm.setChecked(False)
         # Texto corto: QCheckBox no ajusta líneas (el modelo del disco ya está en el resumen).
         self.confirm.setText(f"Entiendo que se borrará todo el contenido del Disco {p.target.number}"
                              if not o.dry_run else

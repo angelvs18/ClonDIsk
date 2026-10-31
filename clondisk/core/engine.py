@@ -35,7 +35,7 @@ from .mbr import MbrEntry, build_mbr
 from .model import MiB, fmt_size
 from .planner import ClonePlan, PlannedPartition
 from .scan import scan_disk
-from .winprep import assess_health
+from .winprep import PENDING_UPDATES_WARNING, assess_health
 
 BootCheck = Tuple[bool, str]
 MAX_BAD_SECTOR_LOG = 50
@@ -71,6 +71,7 @@ class CloneResult:
     warnings: List[str] = field(default_factory=list)
     bad_sectors: List[int] = field(default_factory=list)   # LBA del origen copiados con ceros
     boot_checks: List[BootCheck] = field(default_factory=list)
+    notices: List[str] = field(default_factory=list)       # avisos para la pantalla final
 
     @property
     def boot_ok(self) -> bool:
@@ -116,6 +117,7 @@ class CloneEngine:
         self.warnings: List[str] = []
         self.bad_sectors: List[int] = []
         self.boot_checks: List[BootCheck] = []
+        self.notices: List[str] = []
         self._target_touched = False
 
     # ------------------------------------------------------------------
@@ -157,6 +159,7 @@ class CloneEngine:
             if dry:
                 self.log("MODO SIMULACIÓN: no se escribirá nada en ningún disco", "warn")
             self._log_source_health()
+            self._check_pending_updates()
 
             self.step(1)
             if not dry:
@@ -371,7 +374,7 @@ class CloneEngine:
         elapsed = time.monotonic() - self._t0
         self.log(msg, "ok" if ok else ("warn" if cancelled else "error"))
         return CloneResult(ok, msg, cancelled, elapsed, self.done, list(self.warnings),
-                           list(self.bad_sectors), list(self.boot_checks))
+                           list(self.bad_sectors), list(self.boot_checks), list(self.notices))
 
     def _on_bad_sector(self, lba: int):
         self.bad_sectors.append(lba)
@@ -393,6 +396,24 @@ class CloneEngine:
         if level == "danger":
             self.log("El disco de origen muestra signos de fallo: considera activar «Saltar "
                      "sectores ilegibles» y «Verificar», y respalda primero lo más importante.", "warn")
+
+    def _check_pending_updates(self):
+        win = self.plan.windows_part()
+        if win is None:
+            return
+        try:
+            reasons = self.platform.pending_updates(win.src)
+        except Exception as e:
+            self.log(f"No se pudo comprobar si el Windows de origen tiene actualizaciones "
+                     f"pendientes: {e}")
+            return
+        if reasons is None:
+            return
+        if not reasons:
+            self.log("El Windows de origen no tiene actualizaciones pendientes")
+            return
+        self.log("Actualizaciones pendientes en el Windows de origen: " + "; ".join(reasons), "warn")
+        self.notices.append(PENDING_UPDATES_WARNING)
 
     def _release_snapshots(self):
         for d in self.snap_devices.values():

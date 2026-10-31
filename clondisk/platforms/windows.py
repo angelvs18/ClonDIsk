@@ -28,7 +28,8 @@ from ..core.scan import scan_disk
 from ..core.winprep import (CfaStatus, DiskHealth, DriverBackup, Hive, bcdboot_warnings,
                             bcdedit_partition_letters, choose_bcdboot, count_inf_files,
                             driver_backup_dir, enable_boot_storage_drivers,
-                            match_oem_driver_folders, parse_cfa_preference, write_denied_advice)
+                            match_oem_driver_folders, parse_cfa_preference,
+                            pending_update_reasons, write_denied_advice)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -397,6 +398,7 @@ class WindowsPlatform(Platform):
     def __init__(self):
         self._locked_volumes: List[WinDevice] = []
         self._win_info_cache: Dict[tuple, Optional[WindowsInfo]] = {}
+        self._pending_cache: Dict[tuple, List[str]] = {}
         # Letras que ClonDisk asignó a cada disco destino (número de disco → letras).
         # Se quitan por letra: mbr2gpt renumera las particiones al crear la EFI.
         self._assigned_letters: Dict[int, Set[str]] = {}
@@ -490,24 +492,57 @@ class WindowsPlatform(Platform):
                                           r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
         if not part.letter:
             return None
-        cfg = f"{part.letter}:\\Windows\\System32\\config"
-        hive = os.path.join(cfg, "SOFTWARE")
-        st = os.stat(hive)
-        key = (part.volume_path or part.letter, st.st_size, st.st_mtime_ns)
+        key = self._hive_cache_key(part, ("SOFTWARE",))
         if key in self._win_info_cache:
             return self._win_info_cache[key]
-        td = tempfile.mkdtemp(prefix="clondisk_sw_")
-        try:
-            for name in ("SOFTWARE", "SOFTWARE.LOG1", "SOFTWARE.LOG2"):
-                if os.path.exists(os.path.join(cfg, name)):
-                    shutil.copyfile(os.path.join(cfg, name), os.path.join(td, name))
-            with self._loaded_hive(os.path.join(td, "SOFTWARE"), "CLONDISK_SW", lambda *a: None) as root:
-                info = self._read_version_key(winreg.HKEY_LOCAL_MACHINE,
-                                              rf"{root}\Microsoft\Windows NT\CurrentVersion")
-        finally:
-            shutil.rmtree(td, ignore_errors=True)
+        with self._offline_hive_copies(part.letter, ("SOFTWARE",)) as roots:
+            info = self._read_version_key(winreg.HKEY_LOCAL_MACHINE,
+                                          rf"{roots['SOFTWARE']}\Microsoft\Windows NT\CurrentVersion")
         self._win_info_cache[key] = info
         return info
+
+    @staticmethod
+    def _hive_cache_key(part: Partition, names) -> tuple:
+        cfg = f"{part.letter}:\\Windows\\System32\\config"
+        stats = [os.stat(os.path.join(cfg, n)) for n in names]
+        return (part.volume_path or part.letter, tuple(names),
+                tuple((st.st_size, st.st_mtime_ns) for st in stats))
+
+    @contextlib.contextmanager
+    def _offline_hive_copies(self, letter: str, names):
+        """Carga COPIAS de las colmenas de un Windows sin conexión (el origen no se modifica).
+        Devuelve {nombre: raíz bajo HKLM}."""
+        cfg = f"{letter}:\\Windows\\System32\\config"
+        td = tempfile.mkdtemp(prefix="clondisk_hv_")
+        try:
+            with contextlib.ExitStack() as stack:
+                roots = {}
+                for name in names:
+                    for suffix in ("", ".LOG1", ".LOG2"):
+                        if os.path.exists(os.path.join(cfg, name + suffix)):
+                            shutil.copyfile(os.path.join(cfg, name + suffix),
+                                            os.path.join(td, name + suffix))
+                    roots[name] = stack.enter_context(self._loaded_hive(
+                        os.path.join(td, name), f"CLONDISK_RO_{name}", lambda *a: None))
+                yield roots
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def pending_updates(self, part: Partition) -> Optional[List[str]]:
+        """Actualizaciones a medio instalar en el Windows de origen (lista vacía = ninguna)."""
+        if part.is_boot:
+            windir = os.environ.get("SystemRoot", r"C:\Windows")
+            return pending_update_reasons(WinregHive("SOFTWARE"), WinregHive("SYSTEM"), windir)
+        if not part.letter:
+            return None
+        names = ("SOFTWARE", "SYSTEM")
+        key = self._hive_cache_key(part, names)
+        if key not in self._pending_cache:
+            with self._offline_hive_copies(part.letter, names) as roots:
+                self._pending_cache[key] = pending_update_reasons(
+                    WinregHive(roots["SOFTWARE"]), WinregHive(roots["SYSTEM"]),
+                    f"{part.letter}:\\Windows")
+        return list(self._pending_cache[key])
 
     def host_build(self) -> Optional[int]:
         try:

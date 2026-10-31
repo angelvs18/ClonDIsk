@@ -102,6 +102,10 @@ class Platform:
     def disk_health(self, disk: Disk) -> Optional[DiskHealth]:
         return None
 
+    def pending_updates(self, part: Partition) -> Optional[List[str]]:
+        """Indicios de actualizaciones pendientes en el Windows de ``part`` (None = no se sabe)."""
+        return None
+
     def backup_drivers(self, part: Partition, log: LogFn) -> DriverBackup:
         raise NotImplementedError("El respaldo de drivers no está disponible en esta plataforma")
 

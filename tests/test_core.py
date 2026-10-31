@@ -1017,3 +1017,64 @@ def test_bcdboot_bfsvc_warning_explained():
            "Boot files successfully created.")
     assert any("Acceso controlado" in n for n in bcdboot_warnings(out))
     assert bcdboot_warnings("Boot files successfully created.") == []
+
+
+# ---------------------------------------------------------------- actualizaciones pendientes
+from clondisk.core.winprep import PENDING_UPDATES_WARNING, pending_update_reasons  # noqa: E402
+
+CBS = "Microsoft\\Windows\\CurrentVersion\\Component Based Servicing"
+
+
+def _system_hive(rename_ops=None):
+    sm = {"PendingFileRenameOperations": rename_ops} if rename_ops is not None else {}
+    return DictHive({"Select": {"Current": 1}, "ControlSet001\\Control\\Session Manager": sm})
+
+
+def test_pending_updates_none(tmp_path):
+    (tmp_path / "Windows" / "WinSxS").mkdir(parents=True)
+    software = DictHive({CBS: {}})
+    assert pending_update_reasons(software, _system_hive([]), str(tmp_path / "Windows")) == []
+
+
+def test_pending_updates_detected(tmp_path):
+    winsxs = tmp_path / "Windows" / "WinSxS"
+    winsxs.mkdir(parents=True)
+    (winsxs / "pending.xml").write_text("<?xml version='1.0'?><PendingTransaction/>")
+    software = DictHive({
+        CBS + "\\RebootPending": {},
+        CBS + "\\SessionsPending": {"Exclusive": 1},
+        "Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired": {},
+    })
+    system = _system_hive(["\\??\\C:\\Windows\\temp\\a.dll", ""])
+    reasons = pending_update_reasons(software, system, str(tmp_path / "Windows"))
+    text = " | ".join(reasons)
+    assert len(reasons) == 5
+    for needle in ("pending.xml", "RebootPending", "SessionsPending", "RebootRequired",
+                   "PendingFileRenameOperations"):
+        assert needle in text
+    # Solo con PendingFileRenameOperations (otro ControlSet no cuenta)
+    other = DictHive({"Select": {"Current": 2},
+                      "ControlSet001\\Control\\Session Manager": {"PendingFileRenameOperations": ["x"]},
+                      "ControlSet002\\Control\\Session Manager": {}})
+    assert pending_update_reasons(None, other, None) == []
+
+
+def test_engine_reports_pending_updates_on_final_screen():
+    class PendingPlatform(RamPlatform):
+        def pending_updates(self, part):
+            return ["existe la clave Component Based Servicing\\RebootPending"]
+
+    src = RamDisk(64 * MiB)
+    entries = [MbrEntry(0, 0x80, 0x07, 2048, 20000), MbrEntry(1, 0, 0x07, 22048, 60000)]
+    src.write(0, build_mbr(b"\x33\xC0" + b"\x90" * 438, 0x1234ABCD, entries))
+    for e in entries:
+        src.write(e.start_lba * 512, _fake_ntfs_boot(e.start_lba, e.sectors - 1))
+    sdisk = scan_disk(src, 0, "hdd", compute_usage=False)
+    sdisk.partitions[1].has_windows = True
+    plan = build_plan(sdisk, Disk(1, "ssd", "ssd", 64 * MiB),
+                      CloneOptions(use_vss=False, smart_copy=False, retrim=False, dry_run=True))
+    logs = []
+    res = CloneEngine(PendingPlatform({0: src}), plan,
+                      log=lambda m, l="info": logs.append((l, m))).run()
+    assert res.success and res.notices == [PENDING_UPDATES_WARNING]
+    assert any(l == "warn" and "RebootPending" in m for l, m in logs)

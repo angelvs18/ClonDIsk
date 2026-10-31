@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget)
 
 from ..core.model import MiB, Disk, Partition, fmt_size
-from ..core.planner import (CloneOptions, ClonePlan, build_plan, resizable_candidates,
-                            shrink_target_bytes)
+from ..core.planner import (CloneOptions, ClonePlan, build_plan, estimate_minutes,
+                            fmt_minutes_range, resizable_candidates, shrink_target_bytes)
 from ..core.winprep import (PENDING_UPDATES_WARNING, CfaStatus, DriverBackup, assess_health,
                             cfa_banner_text, gpt_conversion_status, offline_windows,
                             source_windows)
@@ -817,10 +817,11 @@ class CloneWizard(QDialog):
         for wmsg in p.warnings:
             self.msg_box.addWidget(banner(html.escape(wmsg), "warn"))
         if p.ok:
+            boot = ("<b>BIOS → UEFI</b> (mbr2gpt al final)" if p.converts_to_gpt
+                    else f"<b>{p.firmware}</b>")
             self.msg_box.addWidget(banner(
                 f"Se copiarán aprox. <b>{fmt_size(p.estimated_copy_bytes())}</b>. "
-                f"Arranque: <b>{p.final_firmware}</b>"
-                + (" (MBR convertido con mbr2gpt)" if p.converts_to_gpt else "") + ".", "info"))
+                f"Arranque: {boot}.", "info"))
         self.btn_shrink.setVisible(bool(p.deficit_sectors and p.resizable_index is not None
                                         and not self.platform.is_lab))
 
@@ -1088,7 +1089,7 @@ class CloneWizard(QDialog):
         if o.retrim:
             ops.append("Enviar TRIM al SSD")
         est = p.estimated_copy_bytes()
-        mins = est / (110 * MiB) / 60
+        lo, hi = estimate_minutes(est, o.verify)
         warn_html = "".join(f"<li style='color:{theme.WARN}'>{e(wm)}</li>" for wm in p.warnings)
         pending = self._pending_reasons()
         if pending:
@@ -1132,8 +1133,9 @@ class CloneWizard(QDialog):
         {boot_html}
         <h3>Operaciones</h3><ol>{''.join(f'<li>{x}</li>' for x in ops)}</ol>
         <ul>{extra_html}</ul>
-        <p>Datos a copiar: <b>{fmt_size(est)}</b> · Tiempo estimado: <b>~{max(1, round(mins))} min</b>
-        (depende de la velocidad del HDD).</p>
+        <p>Datos a copiar: <b>{fmt_size(est)}</b> · Tiempo estimado: <b>{fmt_minutes_range(lo, hi)}</b>
+        ({'incluye verificar, que vuelve a leer todo; ' if o.verify else ''}depende de la
+        velocidad del HDD: al empezar se mide y el registro muestra un estimado más preciso).</p>
         {('<h3>Advertencias</h3><ul>' + warn_html + '</ul>') if warn_html else ''}
         <h3>Después de clonar</h3><ul>
         <li>Apaga el equipo, retira o desconecta el HDD y arranca desde el SSD

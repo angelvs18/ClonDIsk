@@ -33,13 +33,14 @@ from .fs import FsError, ntfs_used_ranges, patch_hidden_sectors
 from .gpt import GptEntry, build_gpt
 from .mbr import MbrEntry, build_mbr
 from .model import MiB, fmt_size
-from .planner import ClonePlan, PlannedPartition
+from .planner import ClonePlan, PlannedPartition, estimate_minutes, fmt_minutes_range
 from .scan import scan_disk
 from .winprep import PENDING_UPDATES_WARNING, assess_health
 
 BootCheck = Tuple[bool, str]
 MAX_BAD_SECTOR_LOG = 50
 VSS_MIN_BYTES = 300 * MiB     # «Reservado para el sistema» y similares: se leen directamente
+SPEED_SAMPLE_BYTES = 256 * MiB  # lectura secuencial para medir la velocidad del origen
 
 
 class TargetWriteDenied(RuntimeError):
@@ -200,6 +201,10 @@ class CloneEngine:
             copy_total = sum(ln for r in self.ranges.values() for _, ln in r)
             self.total = copy_total * (2 if opts.verify else 1)
             self.log(f"Datos a copiar: {fmt_size(copy_total)}")
+            speed = self._measure_read_speed(src)
+            lo, hi = estimate_minutes(copy_total, opts.verify, speed)
+            self.log(f"Tiempo estimado: {fmt_minutes_range(lo, hi)}"
+                     + (" (incluye verificar)" if opts.verify else ""))
             if dry:
                 return self._finish(True, "Simulación completada: el plan es válido. "
                                     f"Se copiarían {fmt_size(copy_total)}.")
@@ -454,6 +459,36 @@ class CloneEngine:
                     pp.copy_mode = "raw"
             self.ranges[pp.new_index] = [(0, size)]
             self.log(f"{pp.src.display_name()} — {pp.src.fs}, copia sector a sector de {fmt_size(size)}")
+
+    def _measure_read_speed(self, src: Device) -> Optional[float]:
+        """Lectura secuencial corta (~256 MB) del origen para estimar el tiempo real."""
+        plan, ss = self.plan, self.plan.sector_size
+        pp = plan.windows_part() or max(plan.parts, key=lambda x: x.src.sectors, default=None)
+        if pp is None:
+            return None
+        off = pp.src.start_lba * ss
+        length = min(SPEED_SAMPLE_BYTES, pp.copy_sectors() * ss)
+        done, chunk = 0, 8 * MiB
+        t0 = time.monotonic()
+        try:
+            while done < length:
+                self._check_cancel()
+                n = min(chunk, length - done)
+                src.read(off + done, n)
+                done += n
+        except CancelledError:
+            raise
+        except Exception as e:
+            self.log(f"No se pudo medir la velocidad de lectura del origen ({e}); "
+                     "el tiempo estimado es aproximado")
+            return None
+        dt = time.monotonic() - t0
+        if done <= 0 or dt <= 0:
+            return None
+        speed = done / dt
+        self.log(f"Velocidad de lectura del origen: {fmt_size(speed)}/s "
+                 f"(lectura secuencial de {fmt_size(done)})")
+        return speed
 
     def _wipe_tables(self, dst: Device):
         """Borra la tabla antigua (inicio) y la GPT de respaldo (final)."""

@@ -14,12 +14,48 @@ Reglas principales
 """
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .gpt import new_guid, usable_range
-from .model import Disk, MiB, Partition, align_down, align_up
+from .model import Disk, GiB, MiB, Partition, align_down, align_up
+
+# Lectura secuencial típica de un HDD cuando no se ha medido (bytes/s): rango lento–rápido.
+HDD_READ_RANGE = (80 * MiB, 130 * MiB)
+POST_COPY_MINUTES = 2      # tabla, bcdboot, mbr2gpt, comprobaciones, TRIM
+
+
+def estimate_minutes(copy_bytes: int, verify: bool,
+                     read_bps: Optional[float] = None) -> Tuple[int, int]:
+    """Rango (mín, máx) de minutos. Verificar vuelve a leer todo: dobla el tiempo de lectura.
+    Con una velocidad medida (``read_bps``) el rango se estrecha; el interior de un HDD es
+    más lento que su principio, de ahí el margen hacia abajo."""
+    passes = 2 if verify else 1
+    if read_bps and read_bps > 0:
+        slow, fast = read_bps * 0.75, read_bps
+    else:
+        slow, fast = HDD_READ_RANGE
+    lo = copy_bytes * passes / fast / 60
+    hi = copy_bytes * passes / slow / 60 + POST_COPY_MINUTES
+    return max(1, math.floor(lo)), max(1, math.ceil(hi))
+
+
+def fmt_minutes_range(lo: int, hi: int) -> str:
+    if lo >= hi:
+        return f"~{lo} min"
+    if hi >= 120:
+        return f"{lo / 60:.1f}–{hi / 60:.1f} h"
+    return f"{lo}–{hi} min"
+
+
+def fmt_shortfall(n_bytes: int) -> str:
+    """Espacio que falta, redondeado hacia arriba: «354 GB», «512 MB»."""
+    if n_bytes >= GiB:
+        return f"{math.ceil(n_bytes / GiB)} GB"
+    return f"{max(1, math.ceil(n_bytes / MiB))} MB"
+
 
 UNSUPPORTED_ROLES = {
     "ldm": "Los discos dinámicos (LDM) no son compatibles",
@@ -270,9 +306,9 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
             if used is not None and target_size * ss < used + margin:
                 err("El destino es demasiado pequeño incluso reduciendo la partición "
                     f"{res_part.display_name()} (faltan "
-                    f"{((min_needed - target_size) * ss) // MiB} MiB)")
+                    f"{fmt_shortfall((min_needed - target_size) * ss)})")
             else:
-                err(f"El destino es {((-free) * ss) // MiB} MiB más pequeño de lo necesario. "
+                err(f"El destino es demasiado pequeño: faltan {fmt_shortfall(-free * ss)}. "
                     f"Reduce primero la partición {res_part.display_name()} del origen "
                     "(botón «Reducir partición de origen»).")
             return plan
@@ -281,7 +317,7 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
         sizes[res_part.index] = chosen
     elif free < 0:
         plan.deficit_sectors = -free
-        err(f"El destino es {((-free) * ss) // MiB} MiB más pequeño de lo necesario y no "
+        err(f"El destino es demasiado pequeño: faltan {fmt_shortfall(-free * ss)} y no "
             "hay ninguna partición NTFS que pueda ajustarse")
         return plan
 

@@ -1078,3 +1078,63 @@ def test_engine_reports_pending_updates_on_final_screen():
                       log=lambda m, l="info": logs.append((l, m))).run()
     assert res.success and res.notices == [PENDING_UPDATES_WARNING]
     assert any(l == "warn" and "RebootPending" in m for l, m in logs)
+
+
+# ---------------------------------------------------------------- tiempo estimado y déficit
+from clondisk.core.model import fmt_size  # noqa: E402
+from clondisk.core.planner import (estimate_minutes, fmt_minutes_range,  # noqa: E402
+                                   fmt_shortfall)
+
+
+def test_estimate_doubles_with_verify_and_is_a_range():
+    data = 53 * GiB                                   # caso real: ~53 GB, ~14 min con verificar
+    lo1, hi1 = estimate_minutes(data, verify=False)
+    lo2, hi2 = estimate_minutes(data, verify=True)
+    assert lo1 < hi1 and lo2 < hi2
+    assert 6 <= lo1 <= 7 and 2 * lo1 - 1 <= lo2 <= 2 * lo1 + 1
+    assert lo2 <= 14 <= hi2                           # el tiempo real cae dentro del rango
+    assert hi2 - 2 >= 2 * (hi1 - 2) - 1               # la parte de lectura también se dobla
+    assert fmt_minutes_range(lo2, hi2) == f"{lo2}–{hi2} min"
+
+
+def test_estimate_uses_measured_speed():
+    data = 53 * GiB
+    wide = estimate_minutes(data, True)
+    lo, hi = estimate_minutes(data, True, read_bps=125 * MiB)
+    assert wide[0] <= lo and hi <= wide[1] and hi - lo < wide[1] - wide[0]
+    assert lo == int(data * 2 / (125 * MiB) / 60)
+    assert estimate_minutes(10 * MiB, False, read_bps=1e12) == (1, 3)
+    assert fmt_minutes_range(5, 5) == "~5 min" and fmt_minutes_range(150, 210) == "2.5–3.5 h"
+
+
+def test_deficit_message_in_readable_gb():
+    assert fmt_shortfall(362464 * MiB) == "354 GB"
+    assert fmt_shortfall(300 * MiB) == "300 MB" and fmt_shortfall(GiB + 1) == "2 GB"
+    plan = build_plan(real_source(), real_target(), CloneOptions(convert_to_gpt=True))
+    msg = " ".join(plan.errors)
+    assert "faltan" in msg and " GB" in msg and "MiB" not in msg
+
+
+class SlowDisk(RamDisk):
+    def read(self, off, n):
+        import time
+        time.sleep(0.002)
+        return super().read(off, n)
+
+
+def test_engine_measures_speed_while_analyzing():
+    src = SlowDisk(64 * MiB)
+    entries = [MbrEntry(0, 0x80, 0x07, 2048, 20000), MbrEntry(1, 0, 0x07, 22048, 60000)]
+    src.write(0, build_mbr(b"\x33\xC0" + b"\x90" * 438, 0x1234ABCD, entries))
+    for e in entries:
+        src.write(e.start_lba * 512, _fake_ntfs_boot(e.start_lba, e.sectors - 1))
+    sdisk = scan_disk(src, 0, "hdd", compute_usage=False)
+    sdisk.partitions[1].has_windows = True
+    plan = build_plan(sdisk, Disk(1, "ssd", "ssd", 64 * MiB),
+                      CloneOptions(use_vss=False, smart_copy=False, verify=True, dry_run=True))
+    logs = []
+    res = CloneEngine(RamPlatform({0: src}), plan, log=lambda m, l="info": logs.append(m)).run()
+    assert res.success
+    speed = [m for m in logs if m.startswith("Velocidad de lectura del origen")]
+    assert speed and fmt_size(60000 * 512) in speed[0]       # toda la partición (< 256 MB)
+    assert any(m.startswith("Tiempo estimado") and "incluye verificar" in m for m in logs)

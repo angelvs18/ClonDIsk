@@ -548,6 +548,33 @@ def classify_boot_signature(issuer: Optional[str], chain: Iterable[str] = ()) ->
 
 
 # ---------------------------------------------------------------------------
+# Lista posterior a la migración
+# ---------------------------------------------------------------------------
+def post_migration_checklist(uefi: bool) -> List[str]:
+    """Qué revisar en el equipo nuevo (asistente, pantalla final y README)."""
+    items = []
+    if uefi:
+        items.append("Secure Boot: " + SECURE_BOOT_HELP)
+    items += [
+        "Primer arranque: puede tardar más de lo normal o terminar actualizaciones pendientes "
+        "(pantalla negra con solo el Administrador de tareas, «Deshaciendo cambios»). No lo "
+        "apagues; espera a ver el escritorio.",
+        "Drivers: deja que Windows Update instale los del equipo nuevo y descarga los que falten "
+        "del sitio de soporte del fabricante. Los del origen quedaron respaldados en "
+        "Documentos\\ClonDisk.",
+        "WinRE: ejecuta «reagentc /enable» como administrador y comprueba con «reagentc /info» "
+        "que diga Enabled.",
+        "IP fija: si un dispositivo se conecta directo por cable (p. ej. un plotter por RJ45), "
+        "pon en la tarjeta nueva la IP de la anterior (en el escritorio quedan "
+        f"«{NETWORK_TXT_NAME}» y «{NETWORK_PS1_NAME}»).",
+        "Reactivación: Windows y el software con licencia pueden pedir reactivarse por el "
+        "cambio de hardware.",
+        "Guarda el disco de origen sin borrarlo unas semanas, hasta comprobar que todo funciona.",
+    ]
+    return items
+
+
+# ---------------------------------------------------------------------------
 # Acceso controlado a carpetas (Windows Defender)
 # ---------------------------------------------------------------------------
 # EnableControlledFolderAccess: 0 desactivado, 1 activado, 2 auditoría,

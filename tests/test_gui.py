@@ -148,3 +148,38 @@ def test_summary_blocks_start_until_cfa_resolved(app, monkeypatch):
         assert w.cfa_box.isHidden() and w.btn_next.isEnabled()
     finally:
         w.close()
+
+
+# ---------------------------------------------------------------- pantalla final completa
+def test_final_screen_shows_notices_network_winre_and_checklist(app):
+    from clondisk.core.engine import CloneResult
+    from clondisk.core.winprep import (PENDING_UPDATES_WARNING, WINRE_ENABLE_HINT, StaticIp,
+                                       post_migration_checklist)
+    from clondisk.gui.progress import ProgressDialog
+    plan = build_plan(real_source(), real_target(), CloneOptions(convert_to_gpt=True))
+    d = ProgressDialog(Platform(), plan)
+    res = CloneResult(True, "ok",
+                      boot_checks=[(True, "Conversión a GPT/UEFI con mbr2gpt")],
+                      notices=[PENDING_UPDATES_WARNING, WINRE_ENABLE_HINT],
+                      extra_checks=[(True, "WinRE registrado (Winre.wim en partición de recuperación)")],
+                      static_ips=[StaticIp("{G}", "Ethernet", ["192.168.10.5"], ["255.255.255.0"])])
+    d._on_finished(res)
+    d.resize(SCREEN_W, SCREEN_H)
+    d.show()
+    app.processEvents()
+    try:
+        text = d.checks.text()
+        for needle in ("Avisos", "Deshaciendo cambios", "reagentc /enable", "WinRE registrado",
+                       "192.168.10.5", "ClonDisk-restaurar-red.ps1", "Después de la migración",
+                       "Secure Boot", "Guarda el disco de origen"):
+            assert needle in text, needle
+        assert d.minimumSizeHint().height() <= MAX_MIN_HEIGHT
+        assert _inside(d, d.btn_close) and _inside(d, d.btn_save)
+        assert d.btn_disconnect.isHidden()          # la plataforma base no lo admite
+    finally:
+        d.close()
+    uefi, bios = post_migration_checklist(True), post_migration_checklist(False)
+    assert len(uefi) == 7 and len(bios) == 6 and not any("Secure Boot" in x for x in bios)
+    for needle in ("Primer arranque", "Windows Update", "reagentc /enable", "IP fija",
+                   "reactivarse", "disco de origen"):
+        assert any(needle in x for x in uefi), needle

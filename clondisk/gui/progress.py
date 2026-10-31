@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel
 from ..core.engine import STEPS, CloneEngine, CloneResult, fmt_lbas
 from ..core.model import fmt_size
 from ..core.planner import ClonePlan
-from ..core.winprep import NETWORK_PS1_NAME, NETWORK_TXT_NAME, fmt_static_ip
+from ..core.winprep import (NETWORK_PS1_NAME, NETWORK_TXT_NAME, fmt_static_ip,
+                            post_migration_checklist, source_windows)
 from . import theme
 
 
@@ -167,7 +168,7 @@ class ProgressDialog(QDialog):
         self.checks_area.setWidgetResizable(True)
         self.checks_area.setFrameShape(QFrame.NoFrame)
         self.checks_area.setWidget(self.checks)
-        self.checks_area.setMaximumHeight(200)
+        self.checks_area.setMaximumHeight(240)
         self.checks_area.hide()
         lay.addWidget(self.checks_area)
 
@@ -339,6 +340,12 @@ class ProgressDialog(QDialog):
         self.setCursor(Qt.WaitCursor)
         run_in_thread(self, work, on_done=done)
 
+    def _final_uefi(self, result: CloneResult) -> bool:
+        """¿El destino quedó GPT/UEFI? (si mbr2gpt falló, sigue siendo MBR/BIOS)."""
+        if not self.plan.converts_to_gpt:
+            return self.plan.firmware == "UEFI"
+        return any(ok and "mbr2gpt" in text for ok, text in result.boot_checks)
+
     def _show_checks(self, result: CloneResult):
         parts = []
         if result.notices:
@@ -370,6 +377,10 @@ class ProgressDialog(QDialog):
             parts.append(f"<b style='color:{theme.WARN}'>{len(result.bad_sectors)} sector(es) "
                          "ilegibles del origen se copiaron con ceros</b> (LBA): "
                          f"{html.escape(fmt_lbas(result.bad_sectors))}")
+        if result.success and not self.plan.options.dry_run and source_windows(self.plan.source):
+            rows = "".join(f"<div>•&nbsp; {html.escape(x)}</div>"
+                           for x in post_migration_checklist(self._final_uefi(result)))
+            parts.append(f"<b>Después de la migración</b>{rows}")
         if parts:
             self.checks.setText("<br><br>".join(parts))
             self.checks_area.show()

@@ -16,9 +16,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, estimate_minutes,
                             fmt_minutes_range, resizable_candidates, shrink_target_bytes)
-from ..core.winprep import (PENDING_UPDATES_WARNING, SECURE_BOOT_HELP, CfaStatus, DriverBackup,
-                            assess_health, cfa_banner_text, gpt_conversion_status,
-                            offline_windows, source_windows)
+from ..core.winprep import (PENDING_UPDATES_WARNING, CfaStatus, DriverBackup, assess_health,
+                            cfa_banner_text, gpt_conversion_status, offline_windows,
+                            post_migration_checklist, source_windows)
 from . import theme
 from .diskmap import DiskCard, DiskMapWidget, disk_segments, plan_segments
 from .progress import run_in_thread
@@ -1124,7 +1124,8 @@ class CloneWizard(QDialog):
             extra.append("Windows y el software con licencia (p. ej. el del plotter) pueden pedir "
                          "reactivación por el cambio de hardware.")
         extra_html = "".join(f"<li>{e(x)}</li>" for x in extra)
-        secure_boot_html = f"<li>{e(SECURE_BOOT_HELP)}</li>" if p.final_firmware == "UEFI" else ""
+        after_html = "".join(f"<li>{e(x)}</li>"
+                             for x in post_migration_checklist(p.final_firmware == "UEFI"))
         self.summary.setHtml(f"""
         <h3>Origen</h3><p>{e(p.source.title())}{win_html}</p>
         {health_html}
@@ -1139,11 +1140,10 @@ class CloneWizard(QDialog):
         velocidad del HDD: al empezar se mide y el registro muestra un estimado más preciso).</p>
         {('<h3>Advertencias</h3><ul>' + warn_html + '</ul>') if warn_html else ''}
         <h3>Después de clonar</h3><ul>
-        <li>Apaga el equipo, retira o desconecta el HDD y arranca desde el SSD
-        (en la BIOS/UEFI elige el SSD como primer dispositivo).</li>
-        <li>Si aparece la partición de recuperación desactivada, ejecuta
-        <code>reagentc /enable</code> como administrador.</li>
-        {secure_boot_html}</ul>
+        <li>Usa «Preparar para desconectar el disco destino» en la pantalla final, apaga el
+        equipo, retira o desconecta el HDD y arranca desde el SSD (en la BIOS/UEFI elige el SSD
+        como primer dispositivo).</li>
+        {after_html}</ul>
         """)
         if not keep_confirm:
             self.confirm.setChecked(False)

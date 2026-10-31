@@ -12,6 +12,20 @@
 - `bcdboot` usa el del Windows clonado si su build es mayor que la del anfitrión.
 - **Comprobación del arranque** al terminar (MBR 55AA, partición activa, bootmgr, BCD, hidden sectors o archivos EFI, y `bcdedit /enum {default}`), con ✓/✗ en la pantalla final.
 
+### Correcciones tras la primera migración real (HDD MBR → SSD GPT/UEFI → HP 260 G4)
+
+- **Acceso controlado a carpetas**: se comprueba en el Resumen, antes de clonar (Get-MpPreference: modo 1 o 3 y el ejecutable actual fuera de las aplicaciones permitidas). Un aviso ofrece «Permitir ClonDisk» (Add-MpPreference, con confirmación) y la clonación no empieza hasta resolverlo o hasta que el usuario lo confirme. Se explica el aviso de bcdboot «BFSVC Warning: Failed to flush system partition. Error = [5]».
+- **Actualizaciones pendientes** en el Windows de origen (pending.xml, RebootPending, SessionsPending, RebootRequired, PendingFileRenameOperations), leídas de copias de sus colmenas: aviso en el Resumen y en la pantalla final.
+- **Tiempo estimado** como rango; cuenta «Verificar» (x2) y se ajusta con una lectura secuencial de ~256 MB del origen al analizar las particiones.
+- Déficit de espacio en GB legibles («faltan 354 GB») y «Arranque: BIOS → UEFI (mbr2gpt al final)» en la página Particiones.
+- **Letras temporales**: se registran y se quitan por letra (no por número de partición, que mbr2gpt cambia). Corrige «No se pudo quitar la letra Z:». Al terminar, el destino no conserva letras asignadas por ClonDisk.
+- **«Preparar para desconectar el disco destino»** en la pantalla final: Write-VolumeCache por volumen, quita todas las letras y deja el disco offline.
+- El registro muestra el estado de cada **servicio de almacenamiento** aunque no cambie («storahci: Start ya era 0, sin StartOverride»).
+- **WinRE**: se localiza Winre.wim (partición de recuperación o Windows\System32\Recovery), se registra con `reagentc /setreimage /target` y se revisa ReAgent.xml. La comprobación final incluye «WinRE registrado» y la indicación de ejecutar `reagentc /enable` en el primer arranque (no se puede habilitar sin conexión).
+- **Secure Boot**: se registra con qué certificado está firmado `bootmgfw.efi` y se avisa si es «Windows UEFI CA 2023», que los firmwares anteriores a 2023 rechazan con Secure Boot activo.
+- **IP fijas** de la tarjeta de red anterior: se muestran al final y se guardan en el escritorio público del clon (`ClonDisk - red anterior.txt` y `ClonDisk-restaurar-red.ps1`).
+- **Lista posterior a la migración** en el Resumen, en la pantalla final y en el README.
+
 ## 1.0.0
 
 - Primera versión pública.

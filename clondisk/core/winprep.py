@@ -361,6 +361,34 @@ def winre_check(st: WinreStatus) -> Tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
+# Secure Boot: firma del gestor de arranque UEFI
+# ---------------------------------------------------------------------------
+SECURE_BOOT_2023_WARNING = (
+    "El gestor de arranque del destino (bootmgfw.efi) está firmado con el certificado nuevo "
+    "«Windows UEFI CA 2023». Equipos con BIOS anterior a 2023 pueden rechazarlo con Secure "
+    "Boot activo: actualiza la BIOS o desactiva Secure Boot.")
+SECURE_BOOT_HELP = (
+    "Si al arrancar aparece «Se ha detectado una firma no válida. Comprobar directiva de "
+    "arranque seguro», actualiza la BIOS/UEFI del equipo (los firmwares anteriores a 2023 no "
+    "conocen el certificado «Windows UEFI CA 2023») o desactiva Secure Boot en su configuración.")
+
+
+def classify_boot_signature(issuer: Optional[str], chain: Iterable[str] = ()) -> str:
+    """Certificado con el que se firmó bootmgfw.efi, a partir del emisor del firmante y de la
+    cadena: ``"2023"`` (Windows UEFI CA 2023), ``"2011"`` (Microsoft Windows Production PCA
+    2011), ``"unsigned"`` o ``"unknown"``."""
+    texts = [issuer or ""] + [c or "" for c in chain]
+    if not any(t.strip() for t in texts):
+        return "unsigned"
+    for text in texts:                       # el emisor directo manda sobre el resto de la cadena
+        if re.search(r"UEFI CA 2023", text, re.IGNORECASE):
+            return "2023"
+        if re.search(r"Windows Production PCA 2011", text, re.IGNORECASE):
+            return "2011"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Acceso controlado a carpetas (Windows Defender)
 # ---------------------------------------------------------------------------
 # EnableControlledFolderAccess: 0 desactivado, 1 activado, 2 auditoría,

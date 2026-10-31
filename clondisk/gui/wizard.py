@@ -16,9 +16,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, estimate_minutes,
                             fmt_minutes_range, resizable_candidates, shrink_target_bytes)
-from ..core.winprep import (PENDING_UPDATES_WARNING, CfaStatus, DriverBackup, assess_health,
-                            cfa_banner_text, gpt_conversion_status, offline_windows,
-                            source_windows)
+from ..core.winprep import (PENDING_UPDATES_WARNING, SECURE_BOOT_HELP, CfaStatus, DriverBackup,
+                            assess_health, cfa_banner_text, gpt_conversion_status,
+                            offline_windows, source_windows)
 from . import theme
 from .diskmap import DiskCard, DiskMapWidget, disk_segments, plan_segments
 from .progress import run_in_thread
@@ -1124,6 +1124,7 @@ class CloneWizard(QDialog):
             extra.append("Windows y el software con licencia (p. ej. el del plotter) pueden pedir "
                          "reactivación por el cambio de hardware.")
         extra_html = "".join(f"<li>{e(x)}</li>" for x in extra)
+        secure_boot_html = f"<li>{e(SECURE_BOOT_HELP)}</li>" if p.final_firmware == "UEFI" else ""
         self.summary.setHtml(f"""
         <h3>Origen</h3><p>{e(p.source.title())}{win_html}</p>
         {health_html}
@@ -1141,7 +1142,8 @@ class CloneWizard(QDialog):
         <li>Apaga el equipo, retira o desconecta el HDD y arranca desde el SSD
         (en la BIOS/UEFI elige el SSD como primer dispositivo).</li>
         <li>Si aparece la partición de recuperación desactivada, ejecuta
-        <code>reagentc /enable</code> como administrador.</li></ul>
+        <code>reagentc /enable</code> como administrador.</li>
+        {secure_boot_html}</ul>
         """)
         if not keep_confirm:
             self.confirm.setChecked(False)

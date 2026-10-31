@@ -35,8 +35,8 @@ from .mbr import MbrEntry, build_mbr
 from .model import MiB, fmt_size
 from .planner import ClonePlan, PlannedPartition, estimate_minutes, fmt_minutes_range
 from .scan import scan_disk
-from .winprep import (PENDING_UPDATES_WARNING, WINRE_ENABLE_HINT, WinreStatus, assess_health,
-                      winre_check)
+from .winprep import (PENDING_UPDATES_WARNING, SECURE_BOOT_2023_WARNING, WINRE_ENABLE_HINT,
+                      WinreStatus, assess_health, classify_boot_signature, winre_check)
 
 BootCheck = Tuple[bool, str]
 MAX_BAD_SECTOR_LOG = 50
@@ -123,6 +123,7 @@ class CloneEngine:
         self.notices: List[str] = []
         self.extra_checks: List[BootCheck] = []
         self._target_touched = False
+        self._efi_offset: Optional[int] = None    # partición EFI del destino (tras comprobar)
 
     # ------------------------------------------------------------------
     def log(self, msg: str, level: str = "info"):
@@ -285,6 +286,7 @@ class CloneEngine:
             self.step(10)
             self._register_winre()
             self._verify_boot()
+            self._check_boot_signature()
 
             self.step(11)
             if opts.retrim:
@@ -628,6 +630,33 @@ class CloneEngine:
         if not st.enabled:
             self.notices.append(WINRE_ENABLE_HINT)
 
+    def _check_boot_signature(self):
+        """Secure Boot: ¿bootmgfw.efi está firmado con «Windows UEFI CA 2023»? Los firmwares
+        anteriores a 2023 no tienen ese certificado y muestran «firma no válida»."""
+        if self._efi_offset is None:
+            return
+        try:
+            sig = self.platform.boot_signature(self.plan.target, self._efi_offset, self.log)
+        except Exception as e:
+            self.log(f"No se pudo leer la firma de bootmgfw.efi: {e}", "warn")
+            return
+        if not sig:
+            return
+        chain = [str(c) for c in (sig.get("Chain") or [])]
+        kind = classify_boot_signature(sig.get("Issuer"), chain)
+        self.log(f"Firma de \\EFI\\Microsoft\\Boot\\bootmgfw.efi: {sig.get('Status') or '?'}; "
+                 f"firmante: {sig.get('Subject') or '?'}; emisor: {sig.get('Issuer') or '?'}"
+                 + (f"; cadena: {' → '.join(chain)}" if chain else ""))
+        if kind == "2023":
+            self.log(SECURE_BOOT_2023_WARNING, "warn")
+            self.notices.append(SECURE_BOOT_2023_WARNING)
+        elif kind == "2011":
+            self.log("bootmgfw.efi está firmado con «Microsoft Windows Production PCA 2011»: "
+                     "lo aceptan también los firmwares anteriores a 2023")
+        else:
+            self.log("No se reconoció el certificado de bootmgfw.efi"
+                     + (" (no está firmado)" if kind == "unsigned" else ""), "warn")
+
     def _verify_boot(self):
         """Comprueba que el destino puede arrancar. Los fallos son advertencias visibles."""
         plan, opts, ss = self.plan, self.plan.options, self.plan.sector_size
@@ -665,7 +694,7 @@ class CloneEngine:
                 efi = [p for p in disk.partitions if p.role == "efi"]
                 checks.append((bool(efi), "Partición del sistema EFI presente"))
                 if efi:
-                    sys_off = efi[0].start_lba * ss
+                    sys_off = self._efi_offset = efi[0].start_lba * ss
             else:
                 checks.append((False, "El destino no tiene una tabla de particiones válida"))
         if sys_off is not None:

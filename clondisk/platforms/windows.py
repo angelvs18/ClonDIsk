@@ -1145,6 +1145,37 @@ ConvertTo-Json -InputObject @($out) -Compress
             if win_tmp:
                 self._remove_letter(disk, win, log)
 
+    # ------------------------------------------------------------------ Secure Boot
+    def boot_signature(self, disk: Disk, efi_offset: int, log: LogFn) -> Optional[dict]:
+        """Firma Authenticode de \\EFI\\Microsoft\\Boot\\bootmgfw.efi y su cadena."""
+        efi, tmp, _ = self._ensure_letter(disk, efi_offset)
+        path = f"{efi}:\\EFI\\Microsoft\\Boot\\bootmgfw.efi"
+        script = f"""
+$s = Get-AuthenticodeSignature -LiteralPath {ps_str(path)}
+$c = $s.SignerCertificate
+$chain = @()
+if ($c) {{
+  $ch = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+  $ch.ChainPolicy.RevocationMode = 'NoCheck'
+  $ch.ChainPolicy.VerificationFlags = 'AllowUnknownCertificateAuthority'
+  [void]$ch.Build($c)
+  $chain = @($ch.ChainElements | ForEach-Object {{ [string]$_.Certificate.Subject }})
+}}
+[pscustomobject]@{{
+  Status = [string]$s.Status
+  Subject = $(if ($c) {{ [string]$c.Subject }} else {{ '' }})
+  Issuer = $(if ($c) {{ [string]$c.Issuer }} else {{ '' }})
+  Chain = $chain
+}} | ConvertTo-Json -Compress
+"""
+        try:
+            if not os.path.exists(path):
+                raise CommandError(f"no existe {path}")
+            return run_ps_json(script, timeout=120)
+        finally:
+            if tmp:
+                self._remove_letter(disk, efi, log)
+
     # ------------------------------------------------------------------ comprobación del arranque
     def boot_file_checks(self, disk: Disk, style: str, system_offset: int, windows_offset: int,
                          log: LogFn, check_bcd: bool = True) -> List[Tuple[bool, str]]:

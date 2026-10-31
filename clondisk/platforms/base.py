@@ -97,6 +97,10 @@ class Platform:
         """Registra WinRE en el Windows clonado (None = no disponible en esta plataforma)."""
         return None
 
+    def boot_signature(self, disk: Disk, efi_offset: int, log: LogFn) -> Optional[dict]:
+        """Firma de bootmgfw.efi: {Status, Subject, Issuer, Chain} (None = no disponible)."""
+        return None
+
     # --- información del anfitrión y del origen ----------------------------
     def host_build(self) -> Optional[int]:
         return None

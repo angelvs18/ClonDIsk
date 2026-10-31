@@ -1214,3 +1214,52 @@ def test_engine_registers_winre_with_recovery_partition():
     assert res.extra_checks and res.extra_checks[0][0] and "WinRE registrado" in res.extra_checks[0][1]
     assert WINRE_ENABLE_HINT in res.notices
     assert res.boot_ok                              # WinRE no cuenta para «puede arrancar»
+
+
+# ---------------------------------------------------------------- Secure Boot (firma de bootmgfw.efi)
+from clondisk.core.winprep import (SECURE_BOOT_2023_WARNING, SECURE_BOOT_HELP,  # noqa: E402
+                                   classify_boot_signature)
+
+ISSUER_2011 = "CN=Microsoft Windows Production PCA 2011, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+ISSUER_2023 = "CN=Windows UEFI CA 2023, O=Microsoft Corporation, C=US"
+ROOT_2010 = "CN=Microsoft Root Certificate Authority 2010, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+
+
+@pytest.mark.parametrize("issuer, chain, kind", [
+    (ISSUER_2011, [], "2011"),
+    (ISSUER_2023, [], "2023"),
+    ("cn=windows uefi ca 2023, o=microsoft corporation", [], "2023"),
+    ("", ["CN=Microsoft Windows, O=Microsoft Corporation", ISSUER_2023, ROOT_2010], "2023"),
+    ("", ["CN=Microsoft Windows, O=Microsoft Corporation", ISSUER_2011, ROOT_2010], "2011"),
+    (ISSUER_2011, [ISSUER_2023], "2011"),          # manda el emisor directo
+    ("CN=Otra CA", [], "unknown"),
+    ("", [], "unsigned"),
+    (None, None or [], "unsigned"),
+])
+def test_classify_boot_signature(issuer, chain, kind):
+    assert classify_boot_signature(issuer, chain) == kind
+
+
+def test_engine_warns_when_bootmgr_signed_with_2023_ca():
+    class SigPlatform(RamPlatform):
+        def __init__(self, devs, issuer):
+            super().__init__(devs)
+            self.issuer = issuer
+
+        def boot_signature(self, disk, efi_offset, log):
+            return {"Status": "Valid", "Subject": "CN=Microsoft Windows", "Issuer": self.issuer,
+                    "Chain": ["CN=Microsoft Windows", self.issuer, ROOT_2010]}
+
+    plan = build_plan(real_source(), real_target(), CloneOptions())
+    for issuer, warned in ((ISSUER_2023, True), (ISSUER_2011, False)):
+        logs = []
+        eng = CloneEngine(SigPlatform({}, issuer), plan, log=lambda m, l="info": logs.append((l, m)))
+        eng._efi_offset = MiB
+        eng._check_boot_signature()
+        assert (SECURE_BOOT_2023_WARNING in eng.notices) == warned
+        assert any(issuer in m and "bootmgfw.efi" in m for _, m in logs)
+        assert any(l == "warn" for l, _ in logs) == warned
+    eng = CloneEngine(SigPlatform({}, ISSUER_2023), plan, log=lambda *a: None)
+    eng._check_boot_signature()                       # destino MBR/BIOS: no se revisa
+    assert eng.notices == []
+    assert "firma no válida" in SECURE_BOOT_HELP

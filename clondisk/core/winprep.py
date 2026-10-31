@@ -7,7 +7,9 @@ Aquí está la lógica que se puede probar sin discos reales ni ``winreg``:
 * qué ``bcdboot.exe`` usar (el del anfitrión o el del Windows clonado);
 * qué carpetas del DriverStore corresponden a los ``oem*.inf`` (respaldo de drivers);
 * habilitar los drivers de almacenamiento de arranque en una colmena SYSTEM;
-* interpretar la salida de ``bcdedit``.
+* interpretar la salida de ``bcdedit``;
+* Acceso controlado a carpetas, actualizaciones pendientes, IP fijas, WinRE y la firma
+  del gestor de arranque (Secure Boot).
 """
 from __future__ import annotations
 
@@ -208,27 +210,39 @@ class Hive:
         raise NotImplementedError
 
 
-def enable_boot_storage_drivers(hive: Hive, log: Callable[[str], None] = lambda m: None) -> List[str]:
-    """Pone Start=0 en los drivers de almacenamiento de arranque del ControlSet actual y
-    borra sus ``StartOverride``. Evita INACCESSIBLE_BOOT_DEVICE con otra controladora."""
+def current_control_set(hive: Hive) -> str:
     current = hive.get_value("Select", "Current")
     if not isinstance(current, int) or current <= 0:
         raise ValueError("La colmena SYSTEM no tiene un valor Select\\Current válido")
-    cs = f"ControlSet{current:03d}"
+    return f"ControlSet{current:03d}"
+
+
+def enable_boot_storage_drivers(hive: Hive, log: Callable[[str], None] = lambda m: None) -> List[str]:
+    """Pone Start=0 en los drivers de almacenamiento de arranque del ControlSet actual y
+    borra sus ``StartOverride``. Evita INACCESSIBLE_BOOT_DEVICE con otra controladora.
+    Registra el estado de cada servicio aunque no cambie; devuelve solo los cambios."""
+    cs = current_control_set(hive)
     changes: List[str] = []
     for svc in BOOT_STORAGE_SERVICES:
         key = f"{cs}\\Services\\{svc}"
         if not hive.key_exists(key):
+            log(f"{svc}: no está instalado en este Windows (no existe {key})")
             continue
+        state: List[str] = []
         old = hive.get_value(key, "Start")
         if old != 0:
             hive.set_dword(key, "Start", 0)
             changes.append(f"{key}: Start {old} → 0")
+            state.append(f"Start {old} → 0")
+        else:
+            state.append("Start ya era 0")
         if hive.key_exists(key + "\\StartOverride"):
             hive.delete_key(key + "\\StartOverride")
             changes.append(f"{key}\\StartOverride eliminado")
-    for c in changes:
-        log(c)
+            state.append("StartOverride eliminado")
+        else:
+            state.append("sin StartOverride")
+        log(f"{svc}: " + ", ".join(state))
     return changes
 
 

@@ -654,7 +654,20 @@ def test_enable_boot_storage_drivers():
     assert not any("iastoravc\\startoverride" in k for k in hive.keys)
     assert not hive.key_exists(svc2 + "iaStorV")                 # no se crea lo que no existe
     assert hive.get_value(svc1 + "storahci", "Start") == 3       # otro ControlSet intacto
-    assert logs == changes and len(changes) == 4
+    assert len(changes) == 4
+    # Cada servicio aparece en el registro, aunque no cambie.
+    assert logs == ["storahci: Start 3 → 0, StartOverride eliminado",
+                    "stornvme: Start ya era 0, sin StartOverride",
+                    f"iaStorV: no está instalado en este Windows (no existe {svc2}iaStorV)",
+                    "iaStorAVC: Start 3 → 0, StartOverride eliminado"]
+
+
+def test_enable_boot_storage_drivers_logs_unchanged_services():
+    svc = "ControlSet001\\Services\\"
+    hive = DictHive({"Select": {"Current": 1}, svc + "storahci": {"Start": 0}})
+    logs = []
+    assert enable_boot_storage_drivers(hive, logs.append) == []
+    assert "storahci: Start ya era 0, sin StartOverride" in logs and len(logs) == 4
 
 
 def test_enable_boot_storage_drivers_requires_select():

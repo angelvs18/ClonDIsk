@@ -16,8 +16,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, resizable_candidates,
                             shrink_target_bytes)
-from ..core.winprep import (DriverBackup, assess_health, gpt_conversion_status,
-                            offline_windows, source_windows)
+from ..core.winprep import (CfaStatus, DriverBackup, assess_health, cfa_banner_text,
+                            gpt_conversion_status, offline_windows, source_windows)
 from . import theme
 from .diskmap import DiskCard, DiskMapWidget, disk_segments, plan_segments
 from .progress import run_in_thread
@@ -118,6 +118,10 @@ class CloneWizard(QDialog):
         self.driver_backup: Optional[DriverBackup] = None
         self.driver_backup_skipped = False
         self._opts_source: Optional[int] = None     # origen para el que se fijaron las opciones
+        self.cfa: Optional[CfaStatus] = None        # Acceso controlado a carpetas
+        self.cfa_checked = False
+        self.cfa_override = False                   # el usuario confirmó seguir sin permitirlo
+        self._preflight_running = False
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -201,6 +205,7 @@ class CloneWizard(QDialog):
             self._fetch_health()
         elif i == 4:
             self._refresh_summary()
+            self._fetch_health(then=self._fetch_preflight)
         self.btn_back.setEnabled(i > 0)
         self.btn_next.setText("Iniciar clonación" if i == 4 else "Siguiente >")
         self.btn_next.setObjectName("Danger" if i == 4 else "Primary")
@@ -215,7 +220,8 @@ class CloneWizard(QDialog):
             1: self.target is not None,
             2: True,
             3: bool(self.plan and self.plan.ok),
-            4: bool(self.plan and self.plan.ok and self.confirm.isChecked()),
+            4: bool(self.plan and self.plan.ok and self.confirm.isChecked()
+                    and (self.plan.options.dry_run or not self._cfa_blocks())),
         }[i]
         self.btn_next.setEnabled(ok and not self._busy)
 
@@ -271,6 +277,85 @@ class CloneWizard(QDialog):
                 then()
 
         self._run_busy(work, done)
+
+    # ------------------------------------------------------------------ comprobaciones previas
+    def _cfa_blocks(self) -> bool:
+        return bool(self.cfa and self.cfa.blocks and not self.cfa_override)
+
+    def _fetch_preflight(self):
+        """Antes de clonar: ¿bloqueará el Acceso controlado a carpetas la escritura?"""
+        if self.cfa_checked or self._preflight_running:
+            return
+        self._preflight_running = True
+
+        def work():
+            return self.platform.controlled_folder_access()
+
+        def done(res, err):
+            self._preflight_running = False
+            self.cfa_checked = True
+            self.cfa = None if err else res
+            self._update_cfa_box()
+
+        self._run_busy(work, done)
+
+    def _update_cfa_box(self):
+        st = self.cfa
+        show = bool(st and st.blocks)
+        self.cfa_box.setVisible(show)
+        if show:
+            text = html.escape(cfa_banner_text(st))
+            if self.cfa_override:
+                text += ("<br><b>Elegiste continuar sin permitirlo:</b> lo más probable es que "
+                         "Windows deniegue la escritura y la clonación se detenga al empezar.")
+            self.cfa_label.setText("<b>⚠ Acceso controlado a carpetas</b><br>" + text)
+            self.btn_cfa_skip.setVisible(not self.cfa_override)
+        self._update_next()
+
+    def _cfa_allow(self):
+        exe = self.cfa.exe if self.cfa else ""
+        r = QMessageBox.question(
+            self, "Permitir ClonDisk",
+            "Se agregará esta aplicación a las permitidas del «Acceso controlado a carpetas» de "
+            f"Windows Defender:\n\n{exe}\n\nEquivale a ejecutar:\nAdd-MpPreference "
+            f"-ControlledFolderAccessAllowedApplications \"{exe}\"\n\n¿Continuar?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+
+        def work():
+            self.platform.allow_controlled_folder_access(exe)
+            return self.platform.controlled_folder_access()
+
+        def done(res, err):
+            if err:
+                QMessageBox.critical(
+                    self, "Permitir ClonDisk",
+                    f"No se pudo agregar la excepción: {err}\n\nHazlo a mano: Seguridad de Windows → "
+                    "Protección contra virus y amenazas → Administrar la protección contra "
+                    "ransomware → Permitir una aplicación mediante Acceso controlado a carpetas.")
+                return
+            self.cfa = res
+            if res and res.blocks:
+                QMessageBox.warning(
+                    self, "Permitir ClonDisk",
+                    "Windows todavía no muestra ClonDisk como aplicación permitida. Puede que una "
+                    "directiva de la organización controle esta opción; agrégala a mano o "
+                    "consulta con quien administra el equipo.")
+            self._update_cfa_box()
+
+        self._run_busy(work, done)
+
+    def _cfa_skip(self):
+        r = QMessageBox.warning(
+            self, "Continuar sin permitir ClonDisk",
+            "Si continúas sin permitir ClonDisk, lo más probable es que Windows deniegue la "
+            "escritura en el disco destino y la clonación se detenga al empezar (el origen no se "
+            "modifica).\n\n¿Continuar de todos modos?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r == QMessageBox.Yes:
+            self.cfa_override = True
+            self._update_cfa_box()
 
     def _health_html(self) -> str:
         if self.source is None or self.source.number not in self.health:
@@ -900,6 +985,23 @@ class CloneWizard(QDialog):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(page_header("Resumen", "Revisa las operaciones antes de iniciar."))
+        self.cfa_box = QWidget()
+        cl = QVBoxLayout(self.cfa_box)
+        cl.setContentsMargins(0, 0, 0, 6)
+        self.cfa_label = banner("", "error")
+        cl.addWidget(self.cfa_label)
+        row = QHBoxLayout()
+        self.btn_cfa_allow = QPushButton("Permitir ClonDisk")
+        self.btn_cfa_allow.setObjectName("Primary")
+        self.btn_cfa_allow.clicked.connect(self._cfa_allow)
+        self.btn_cfa_skip = QPushButton("Continuar sin permitir…")
+        self.btn_cfa_skip.clicked.connect(self._cfa_skip)
+        row.addWidget(self.btn_cfa_allow)
+        row.addWidget(self.btn_cfa_skip)
+        row.addStretch(1)
+        cl.addLayout(row)
+        self.cfa_box.hide()
+        lay.addWidget(self.cfa_box)
         # QTextBrowser ya es un área con scroll; la casilla de confirmación queda fija
         # debajo, junto a la navegación.
         self.summary = QTextBrowser()
@@ -1009,7 +1111,6 @@ class CloneWizard(QDialog):
         <li>Si aparece la partición de recuperación desactivada, ejecuta
         <code>reagentc /enable</code> como administrador.</li></ul>
         """)
-        self._fetch_health()
         self.confirm.setChecked(False)
         # Texto corto: QCheckBox no ajusta líneas (el modelo del disco ya está en el resumen).
         self.confirm.setText(f"Entiendo que se borrará todo el contenido del Disco {p.target.number}"

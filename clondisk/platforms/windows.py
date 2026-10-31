@@ -25,10 +25,10 @@ from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
 from ..core.model import Disk, Partition, WindowsInfo, fmt_size
 from ..core.scan import scan_disk
-from ..core.winprep import (DiskHealth, DriverBackup, Hive, bcdedit_partition_letters,
-                            choose_bcdboot, count_inf_files, driver_backup_dir,
-                            enable_boot_storage_drivers, match_oem_driver_folders,
-                            write_denied_advice)
+from ..core.winprep import (CfaStatus, DiskHealth, DriverBackup, Hive, bcdboot_warnings,
+                            bcdedit_partition_letters, choose_bcdboot, count_inf_files,
+                            driver_backup_dir, enable_boot_storage_drivers,
+                            match_oem_driver_folders, parse_cfa_preference, write_denied_advice)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -696,12 +696,22 @@ if ($pd) {{
             log(f"No se pudo borrar el layout con IOCTL ({e}); se sobrescribirá al copiar", "warn")
 
     def write_denied_diagnosis(self, disk: Disk) -> str:
+        status = self.controlled_folder_access()
+        return write_denied_advice(status.mode if status else None, sys.executable)
+
+    # ------------------------------------------------------------------ Acceso controlado a carpetas
+    def controlled_folder_access(self) -> Optional[CfaStatus]:
         try:
-            out = run_ps("(Get-MpPreference).EnableControlledFolderAccess", timeout=60).strip()
-            cfa = int(out.splitlines()[-1]) if out else None
-        except (CommandError, ValueError):
-            cfa = None
-        return write_denied_advice(cfa, sys.executable)
+            out = run_ps("Get-MpPreference | Select-Object EnableControlledFolderAccess,"
+                         "ControlledFolderAccessAllowedApplications | ConvertTo-Json -Compress",
+                         timeout=60)
+        except CommandError:
+            return None
+        return parse_cfa_preference(out, sys.executable)
+
+    def allow_controlled_folder_access(self, exe: str) -> None:
+        run_ps(f"Add-MpPreference -ControlledFolderAccessAllowedApplications {ps_str(exe)}",
+               timeout=120)
 
     def _lock_volumes(self, disk: Disk, log: LogFn):
         for p in disk.partitions:
@@ -944,6 +954,8 @@ ConvertTo-Json -InputObject @($out) -Compress
                     f"anfitrión: {host_exe}", "warn")
                 out = run_exe([host_exe] + args)
             log(f"bcdboot: {out.strip()}")
+            for note in bcdboot_warnings(out):
+                log(note, "warn")
         finally:
             if sys_tmp:
                 self._remove_letter(disk, sysl, log)

@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Tuple
 
 from ..core.device import Device
 from ..core.model import Disk, Partition
-from ..core.winprep import DiskHealth, DriverBackup
+from ..core.winprep import CfaStatus, DiskHealth, DriverBackup
 
 LogFn = Callable[[str], None]
 
@@ -39,6 +39,13 @@ class Platform:
 
     def set_offline(self, disk: Disk, log: LogFn) -> None:
         pass
+
+    def controlled_folder_access(self) -> Optional[CfaStatus]:
+        """Estado del «Acceso controlado a carpetas» para el ejecutable actual (None = no aplica)."""
+        return None
+
+    def allow_controlled_folder_access(self, exe: str) -> None:
+        raise NotImplementedError("No disponible en esta plataforma")
 
     def release_target_letters(self, disk: Disk, log: LogFn) -> List[str]:
         """Quita las letras temporales que se asignaron al destino. Devuelve las que quedan."""

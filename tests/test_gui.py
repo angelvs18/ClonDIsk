@@ -105,3 +105,46 @@ def test_drive_letter_shown_once(app):
         assert "E::" not in t, t
     assert texts[0].count("E:") == 1 and texts[1].count("E:") == 1
     assert "Windows 10 Pro" in texts[3] and "C:\\ClonDisk" in texts[2]
+
+
+# ---------------------------------------------------------------- Acceso controlado a carpetas
+def _wait_idle(app, w, timeout=10.0):
+    import time
+    end = time.monotonic() + timeout
+    while (w._busy or w._preflight_running) and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    assert not w._busy
+
+
+def test_summary_blocks_start_until_cfa_resolved(app, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from clondisk.core.winprep import CfaStatus
+    from clondisk.gui.wizard import CloneWizard
+    src, tgt = real_source(), real_target()
+    tgt.size_bytes = 1000 * 1024 ** 3                  # el origen cabe sin reducir
+    w = CloneWizard(Platform(), [src, tgt], src)
+    w.target = tgt
+    try:
+        w.show_page(2)
+        w._read_options()
+        w.show_page(3)
+        w.show_page(4)
+        _wait_idle(app, w)                              # consulta de salud en segundo plano
+        assert w.plan.ok, w.plan.errors
+        w.confirm.setChecked(True)
+        assert w.btn_next.isEnabled()                   # sin bloqueo: se puede iniciar
+        w.cfa, w.cfa_checked = CfaStatus(1, [], r"C:\Apps\ClonDisk.exe"), True
+        w._update_cfa_box()
+        w.confirm.setChecked(True)
+        assert not w.cfa_box.isHidden() and "ClonDisk.exe" in w.cfa_label.text()
+        assert not w.btn_next.isEnabled()
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+        w._cfa_skip()                                   # confirmación explícita
+        assert w.cfa_override and w.btn_next.isEnabled()
+        w.cfa_override = False
+        w.cfa = CfaStatus(1, [r"c:\apps\clondisk.exe"], r"C:\Apps\ClonDisk.exe")
+        w._update_cfa_box()
+        assert w.cfa_box.isHidden() and w.btn_next.isEnabled()
+    finally:
+        w.close()

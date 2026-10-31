@@ -13,6 +13,8 @@ Aquí está la lógica que se puede probar sin discos reales ni ``winreg``:
 """
 from __future__ import annotations
 
+import json
+import ntpath
 import os
 import re
 from dataclasses import dataclass, field
@@ -247,14 +249,89 @@ def enable_boot_storage_drivers(hive: Hive, log: Callable[[str], None] = lambda 
 
 
 # ---------------------------------------------------------------------------
+# Acceso controlado a carpetas (Windows Defender)
+# ---------------------------------------------------------------------------
+# EnableControlledFolderAccess: 0 desactivado, 1 activado, 2 auditoría,
+# 3 bloquear solo la modificación de discos, 4 auditar la modificación de discos.
+CFA_BLOCKING_MODES = {1: "activado", 3: "en modo «bloquear la modificación de discos»"}
+
+
+def _norm_win_path(path: str) -> str:
+    return ntpath.normcase(ntpath.normpath(str(path).strip().strip('"')))
+
+
+@dataclass
+class CfaStatus:
+    mode: Optional[int]                    # EnableControlledFolderAccess
+    allowed: List[str] = field(default_factory=list)
+    exe: str = ""                          # ejecutable actual (sys.executable)
+
+    @property
+    def exe_allowed(self) -> bool:
+        return bool(self.exe) and _norm_win_path(self.exe) in {_norm_win_path(a) for a in self.allowed}
+
+    @property
+    def blocks(self) -> bool:
+        """¿Bloqueará la escritura directa en el disco destino?"""
+        return self.mode in CFA_BLOCKING_MODES and not self.exe_allowed
+
+
+def parse_cfa_preference(output, exe: str) -> Optional[CfaStatus]:
+    """Interpreta ``Get-MpPreference | Select-Object EnableControlledFolderAccess,
+    ControlledFolderAccessAllowedApplications | ConvertTo-Json`` (texto o dict).
+    ``None`` si no se puede saber (p. ej. Defender no es el antivirus activo)."""
+    data = output
+    if isinstance(output, str):
+        text = output.lstrip("﻿").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    mode = data.get("EnableControlledFolderAccess")
+    try:
+        mode = int(mode) if mode is not None else None
+    except (TypeError, ValueError):
+        mode = None
+    allowed = data.get("ControlledFolderAccessAllowedApplications") or []
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    return CfaStatus(mode, [str(a) for a in allowed if a], exe or "")
+
+
+def cfa_banner_text(status: CfaStatus) -> str:
+    """Aviso del Resumen cuando el Acceso controlado a carpetas bloqueará la clonación."""
+    how = CFA_BLOCKING_MODES.get(status.mode, "activado")
+    return (f"El «Acceso controlado a carpetas» de Windows Defender está {how} y "
+            f"{status.exe} no está entre sus aplicaciones permitidas. Windows bloqueará la "
+            "escritura en el disco destino (y bcdboot avisará «BFSVC Warning: Failed to flush "
+            "system partition. Error = [5]»). Permite ClonDisk antes de clonar.")
+
+
+def bcdboot_warnings(output: str) -> List[str]:
+    """Explica avisos conocidos de bcdboot que no detienen la copia de archivos."""
+    notes = []
+    if re.search(r"BFSVC.*Error\s*=\s*\[5\]", output or "", re.IGNORECASE):
+        notes.append("bcdboot no pudo vaciar la caché de la partición de sistema (error 5, acceso "
+                     "denegado). Suele deberse al «Acceso controlado a carpetas» de Windows "
+                     "Defender; los archivos de arranque sí se copian (la comprobación del "
+                     "arranque lo confirma). Para evitarlo, permite ClonDisk en esa protección.")
+    return notes
+
+
+# ---------------------------------------------------------------------------
 # Escritura denegada en el destino
 # ---------------------------------------------------------------------------
 def write_denied_advice(controlled_folder_access: Optional[int], exe: str) -> str:
     """Diagnóstico de un «Acceso denegado (5)» al escribir en el disco destino.
     ``controlled_folder_access``: valor de Get-MpPreference EnableControlledFolderAccess
-    (0 = desactivado, 1 = activado, 2 = solo auditoría, None = desconocido)."""
+    (0 = desactivado, 1 = activado, 2 = solo auditoría, 3 = bloquear la modificación de
+    discos, None = desconocido)."""
     app = exe or "ClonDisk.exe / python.exe"
-    if controlled_folder_access == 1:
+    if controlled_folder_access in CFA_BLOCKING_MODES:
         return ("El «Acceso controlado a carpetas» de Windows Defender está ACTIVADO y bloquea "
                 "la escritura directa en discos (sectores de arranque) de las aplicaciones que "
                 "no reconoce.\n\nPara permitir ClonDisk: Seguridad de Windows → Protección "

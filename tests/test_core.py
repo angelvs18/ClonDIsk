@@ -973,3 +973,47 @@ def test_engine_releases_letters_even_on_failure():
     res = CloneEngine(plat, plan, log=lambda m, l="info": logs.append((l, m))).run()
     assert not res.success and plat.released == 1
     assert any(l == "warn" and "Z:" in m for l, m in logs)
+
+
+# ---------------------------------------------------------------- Acceso controlado a carpetas
+from clondisk.core.winprep import (CfaStatus, bcdboot_warnings, cfa_banner_text,  # noqa: E402
+                                   parse_cfa_preference)
+
+EXE = r"C:\Users\Taller\Desktop\ClonDisk.exe"
+
+
+@pytest.mark.parametrize("output, blocks", [
+    # Get-MpPreference | Select-Object ... | ConvertTo-Json -Compress
+    ('{"EnableControlledFolderAccess":1,"ControlledFolderAccessAllowedApplications":null}', True),
+    ('{"EnableControlledFolderAccess":1,"ControlledFolderAccessAllowedApplications":'
+     r'"C:\\Otro\\app.exe"}', True),
+    ('{"EnableControlledFolderAccess":1,"ControlledFolderAccessAllowedApplications":'
+     r'["C:\\Otro\\app.exe","c:\\users\\taller\\desktop\\CLONDISK.EXE"]}', False),
+    ('{"EnableControlledFolderAccess":3,"ControlledFolderAccessAllowedApplications":[]}', True),
+    ('{"EnableControlledFolderAccess":2,"ControlledFolderAccessAllowedApplications":null}', False),
+    ('{"EnableControlledFolderAccess":0,"ControlledFolderAccessAllowedApplications":null}', False),
+    ('\ufeff{"EnableControlledFolderAccess":1}\r\n', True),
+])
+def test_controlled_folder_access_detection(output, blocks):
+    st = parse_cfa_preference(output, EXE)
+    assert st is not None and st.blocks == blocks
+    if blocks:
+        text = cfa_banner_text(st)
+        assert EXE in text and "BFSVC" in text
+
+
+def test_controlled_folder_access_unknown_and_python_exe():
+    assert parse_cfa_preference("", EXE) is None
+    assert parse_cfa_preference("no es json", EXE) is None
+    py = r"C:\Program Files\Python312\python.exe"
+    st = parse_cfa_preference({"EnableControlledFolderAccess": 1,
+                               "ControlledFolderAccessAllowedApplications": [f'"{py}"']}, py)
+    assert st.exe_allowed and not st.blocks
+    assert CfaStatus(1, [], "").blocks          # sin ejecutable conocido: se asume bloqueo
+
+
+def test_bcdboot_bfsvc_warning_explained():
+    out = ("BFSVC Warning: Failed to flush system partition. Error = [5]\r\n"
+           "Boot files successfully created.")
+    assert any("Acceso controlado" in n for n in bcdboot_warnings(out))
+    assert bcdboot_warnings("Boot files successfully created.") == []

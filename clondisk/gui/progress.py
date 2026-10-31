@@ -8,13 +8,15 @@ import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget,
+from PySide6.QtWidgets import (QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
-                               QTextEdit, QVBoxLayout, QWidget)
+                               QScrollArea, QTextEdit, QVBoxLayout, QWidget)
 
-from ..core.engine import STEPS, CloneEngine, CloneResult
+from ..core.engine import STEPS, CloneEngine, CloneResult, fmt_lbas
 from ..core.model import fmt_size
 from ..core.planner import ClonePlan
+from ..core.winprep import (NETWORK_PS1_NAME, NETWORK_TXT_NAME, fmt_static_ip,
+                            post_migration_checklist, source_windows)
 from . import theme
 
 
@@ -118,8 +120,12 @@ class ProgressDialog(QDialog):
     def __init__(self, platform, plan: ClonePlan, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Clonando disco")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowMinMaxButtonsHint)
         theme.fit_to_screen(self, 900, 640)
         self.setModal(True)
+        self.platform = platform
+        self.plan = plan
         self.result: CloneResult | None = None
         self._running = False
         self._t0 = time.monotonic()
@@ -152,6 +158,19 @@ class ProgressDialog(QDialog):
         self.banner.setWordWrap(True)
         self.banner.hide()
         lay.addWidget(self.banner)
+        self.checks = QLabel("")
+        self.checks.setObjectName("Card")
+        self.checks.setWordWrap(True)
+        self.checks.setTextFormat(Qt.RichText)
+        self.checks.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # Con scroll y altura limitada: una lista larga no empuja los botones fuera de la pantalla.
+        self.checks_area = QScrollArea()
+        self.checks_area.setWidgetResizable(True)
+        self.checks_area.setFrameShape(QFrame.NoFrame)
+        self.checks_area.setWidget(self.checks)
+        self.checks_area.setMaximumHeight(240)
+        self.checks_area.hide()
+        lay.addWidget(self.checks_area)
 
         self.step_label = QLabel("Preparando…")
         self.step_label.setStyleSheet("font-weight:600;")
@@ -185,6 +204,12 @@ class ProgressDialog(QDialog):
         self.btn_save = QPushButton("Guardar registro…")
         self.btn_save.clicked.connect(self._save_log)
         btns.addWidget(self.btn_save)
+        self.btn_disconnect = QPushButton("Preparar para desconectar el disco destino")
+        self.btn_disconnect.setToolTip("Escribe la caché de cada volumen, quita todas las letras "
+                                       "del destino y lo deja offline.")
+        self.btn_disconnect.clicked.connect(self._prepare_disconnect)
+        self.btn_disconnect.hide()
+        btns.addWidget(self.btn_disconnect)
         btns.addStretch(1)
         self.btn_cancel = QPushButton("Cancelar")
         self.btn_cancel.setObjectName("Danger")
@@ -264,14 +289,18 @@ class ProgressDialog(QDialog):
         self.thread.wait()
         self.btn_cancel.setEnabled(False)
         self.btn_close.setEnabled(True)
-        kind = "ok" if result.success else ("warn" if result.cancelled else "error")
+        boot_ok = result.boot_ok
+        kind = ("ok" if boot_ok and not result.bad_sectors else "warn") if result.success else \
+            ("warn" if result.cancelled else "error")
         text = result.message
         if result.success:
             self.bar.setValue(1000)
             self.lbl_pct.setText("100 %")
+            check_step = STEPS.index("Comprobar arranque")
             for i in range(self.steps.count()):
-                self.steps.item(i).setText(f"✓  {STEPS[i]}")
-                self.steps.item(i).setForeground(QColor(theme.OK))
+                bad = i == check_step and not boot_ok
+                self.steps.item(i).setText(f"{'✗' if bad else '✓'}  {STEPS[i]}")
+                self.steps.item(i).setForeground(QColor(theme.WARN if bad else theme.OK))
             text += f"  ·  Tiempo total {fmt_time(result.elapsed)}"
             if result.warnings:
                 text += f"  ·  {len(result.warnings)} advertencia(s), revisa el registro"
@@ -280,7 +309,81 @@ class ProgressDialog(QDialog):
         self.banner.style().unpolish(self.banner)
         self.banner.style().polish(self.banner)
         self.banner.show()
+        self._show_checks(result)
         self.step_label.setText("Terminado" if result.success else "Detenido")
+        self.btn_disconnect.setVisible(getattr(self.platform, "supports_prepare_disconnect", False)
+                                       and not self.plan.options.dry_run)
+
+    def _prepare_disconnect(self):
+        target = self.plan.target
+
+        def work():
+            return self.platform.prepare_disconnect(target, lambda *a: None)
+
+        def done(lines, err):
+            self.btn_disconnect.setEnabled(True)
+            self.setCursor(Qt.ArrowCursor)
+            for line in lines or []:
+                self._on_log(line, "info")
+            if err:
+                self._on_log(f"No se pudo preparar el Disco {target.number} para desconectarlo: {err}",
+                             "error")
+                QMessageBox.warning(self, "Preparar para desconectar",
+                                    f"No se pudo preparar el Disco {target.number}:\n\n{err}")
+                return
+            self._on_log(f"Disco {target.number}: ya puedes desconectarlo", "ok")
+            QMessageBox.information(self, "Preparar para desconectar",
+                                    f"Ya puedes desconectar el disco (Disco {target.number}, "
+                                    f"{target.model}).")
+
+        self.btn_disconnect.setEnabled(False)
+        self.setCursor(Qt.WaitCursor)
+        run_in_thread(self, work, on_done=done)
+
+    def _final_uefi(self, result: CloneResult) -> bool:
+        """¿El destino quedó GPT/UEFI? (si mbr2gpt falló, sigue siendo MBR/BIOS)."""
+        if not self.plan.converts_to_gpt:
+            return self.plan.firmware == "UEFI"
+        return any(ok and "mbr2gpt" in text for ok, text in result.boot_checks)
+
+    def _show_checks(self, result: CloneResult):
+        parts = []
+        if result.notices:
+            rows = "".join(f"<div style='color:{theme.WARN}'>⚠&nbsp; {html.escape(n)}</div>"
+                           for n in result.notices)
+            parts.append(f"<b>Avisos</b>{rows}")
+        if result.boot_checks:
+            rows = "".join(
+                f"<div style='color:{theme.OK if ok else theme.DANGER}'>"
+                f"<b>{'✓' if ok else '✗'}</b>&nbsp; {html.escape(text)}</div>"
+                for ok, text in result.boot_checks)
+            title = "Comprobación del arranque" if result.boot_ok else \
+                "Comprobación del arranque — HAY PROBLEMAS, no instales el SSD todavía"
+            parts.append(f"<b>{title}</b>{rows}")
+        if result.static_ips:
+            rows = "".join(f"<div>{html.escape(fmt_static_ip(ip))}</div>" for ip in result.static_ips)
+            parts.append(
+                "<b>Red con IP fija (tarjeta anterior)</b>" + rows
+                + f"<div style='color:{theme.MUTED}'>La tarjeta del equipo nuevo no hereda esta IP. "
+                f"En el escritorio del Windows clonado quedan «{html.escape(NETWORK_TXT_NAME)}» y "
+                f"«{html.escape(NETWORK_PS1_NAME)}» para aplicarla.</div>")
+        if result.extra_checks:
+            rows = "".join(
+                f"<div style='color:{theme.OK if ok else theme.WARN}'>"
+                f"<b>{'✓' if ok else '✗'}</b>&nbsp; {html.escape(text)}</div>"
+                for ok, text in result.extra_checks)
+            parts.append(f"<b>Otras comprobaciones</b>{rows}")
+        if result.bad_sectors:
+            parts.append(f"<b style='color:{theme.WARN}'>{len(result.bad_sectors)} sector(es) "
+                         "ilegibles del origen se copiaron con ceros</b> (LBA): "
+                         f"{html.escape(fmt_lbas(result.bad_sectors))}")
+        if result.success and not self.plan.options.dry_run and source_windows(self.plan.source):
+            rows = "".join(f"<div>•&nbsp; {html.escape(x)}</div>"
+                           for x in post_migration_checklist(self._final_uefi(result)))
+            parts.append(f"<b>Después de la migración</b>{rows}")
+        if parts:
+            self.checks.setText("<br><br>".join(parts))
+            self.checks_area.show()
 
     def _ask_cancel(self):
         if not self._running:

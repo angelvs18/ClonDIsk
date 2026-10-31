@@ -65,6 +65,28 @@ def align_down(value: int, align: int) -> int:
 
 
 @dataclass
+class WindowsInfo:
+    """Versión de un Windows leída de su colmena SOFTWARE."""
+    product_name: str = ""
+    build: Optional[int] = None
+    edition: str = ""
+
+    @property
+    def is_win10_or_later(self) -> bool:
+        return self.build is not None and self.build >= 10240
+
+    def display(self) -> str:
+        name = self.product_name or "Windows"
+        # Windows 11 sigue declarando «Windows 10» en ProductName.
+        if self.build is not None and self.build >= 22000 and name.startswith("Windows 10"):
+            name = "Windows 11" + name[len("Windows 10"):]
+        extra = [f"build {self.build}" if self.build is not None else "build ?"]
+        if self.edition:
+            extra.append(self.edition)
+        return f"{name} ({', '.join(extra)})"
+
+
+@dataclass
 class Partition:
     index: int                      # posición 1-based en la tabla
     start_lba: int
@@ -84,6 +106,7 @@ class Partition:
     has_windows: bool = False
     is_boot: bool = False      # contiene el Windows en ejecución
     is_system: bool = False    # partición de arranque (EFI / activa)
+    win_info: Optional[WindowsInfo] = None  # versión del Windows que contiene
 
     # ------------------------------------------------------------------
     @property

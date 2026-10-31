@@ -5,23 +5,33 @@ Requiere ejecutarse como administrador y Python de 64 bits.
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 import gc
+import hashlib
 import json
 import re
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
-from ..core.model import Disk, Partition
+from ..core.model import Disk, Partition, WindowsInfo, fmt_size
 from ..core.scan import scan_disk
+from ..core.winprep import (NETWORK_PS1_NAME, NETWORK_TXT_NAME, CfaStatus, DiskHealth,
+                            DriverBackup, Hive, StaticIp, WinreStatus, bcdboot_warnings,
+                            bcdedit_partition_letters, choose_bcdboot, count_inf_files,
+                            driver_backup_dir, enable_boot_storage_drivers, find_winre_folder,
+                            match_oem_driver_folders, network_report_text,
+                            parse_cfa_preference, pending_update_reasons, read_static_ips,
+                            restore_network_script, winre_status_from_xml, write_denied_advice)
 from .base import LogFn, Platform
 
 # --- Constantes Win32 -------------------------------------------------------
@@ -36,6 +46,7 @@ INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 IOCTL_DISK_UPDATE_PROPERTIES = 0x00070140
+IOCTL_DISK_DELETE_DRIVE_LAYOUT = 0x0007C100
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090083
 FSCTL_LOCK_VOLUME = 0x00090018
@@ -118,7 +129,7 @@ class _K32:
 
 def _winerr(msg: str) -> DeviceError:
     code = ctypes.get_last_error()
-    return DeviceError(f"{msg}: {ctypes.FormatError(code).strip()} (código {code})")
+    return DeviceError(f"{msg}: {ctypes.FormatError(code).strip()} (código {code})", code)
 
 
 class WinDevice(Device):
@@ -252,6 +263,98 @@ def run_diskpart(lines: List[str], timeout: int = 600) -> str:
             pass
 
 
+def _decode_log(raw: bytes) -> str:
+    if raw.startswith(b"\xff\xfe") or raw[1:2] == b"\0":
+        return raw.decode("utf-16-le", "replace").lstrip("\ufeff")
+    return raw.decode("utf-8" if raw.startswith(b"\xef\xbb\xbf") else "mbcs", "replace").lstrip("\ufeff")
+
+
+FOLDERID_DOCUMENTS = "FDD39AD0-238F-46AF-ADB4-6C85480369C7"
+
+
+def _documents_dir() -> Optional[str]:
+    """Carpeta «Documentos» real del usuario con SHGetKnownFolderPath(FOLDERID_Documents):
+    respeta la redirección (OneDrive, otra unidad). ``None`` si no se puede obtener; no se
+    arma la ruta a partir de %USERPROFILE%, porque puede no existir."""
+    import uuid
+    from ctypes import wintypes as wt
+    try:
+        guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(FOLDERID_DOCUMENTS).bytes_le)
+        path = ctypes.c_wchar_p()
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, wt.DWORD, wt.HANDLE,
+                                                 ctypes.POINTER(ctypes.c_wchar_p)]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        hr = shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path))
+        try:
+            return path.value if hr == 0 and path.value else None
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(path)
+    except Exception:
+        return None
+
+
+def _file_digest(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+class WinregHive(Hive):
+    """Colmena cargada en ``HKLM\\<root>`` (con ``reg load``)."""
+
+    def __init__(self, root: str):
+        import winreg
+        self.winreg = winreg
+        self.root = root
+
+    def _open(self, path: str, write: bool = False):
+        w = self.winreg
+        access = w.KEY_READ | (w.KEY_WRITE if write else 0) | w.KEY_WOW64_64KEY
+        return w.OpenKey(w.HKEY_LOCAL_MACHINE, f"{self.root}\\{path}", 0, access)
+
+    def key_exists(self, path: str) -> bool:
+        try:
+            self._open(path).Close()
+            return True
+        except OSError:
+            return False
+
+    def get_value(self, path: str, name: str):
+        try:
+            with self._open(path) as k:
+                return self.winreg.QueryValueEx(k, name)[0]
+        except OSError:
+            return None
+
+    def set_dword(self, path: str, name: str, value: int) -> None:
+        with self._open(path, write=True) as k:
+            self.winreg.SetValueEx(k, name, 0, self.winreg.REG_DWORD, int(value))
+
+    def subkeys(self, path: str) -> List[str]:
+        subs = []
+        try:
+            with self._open(path) as k:
+                i = 0
+                while True:
+                    try:
+                        subs.append(self.winreg.EnumKey(k, i))
+                    except OSError:
+                        break
+                    i += 1
+        except OSError:
+            pass
+        return subs
+
+    def delete_key(self, path: str) -> None:
+        w = self.winreg
+        subs = self.subkeys(path)
+        for sub in subs:
+            self.delete_key(f"{path}\\{sub}")
+        parent, _, leaf = path.rpartition("\\")
+        with self._open(parent, write=True) as k:
+            w.DeleteKey(k, leaf)
+
+
 def run_exe(args: List[str], timeout: int = 600) -> str:
     r = subprocess.run(args, capture_output=True, timeout=timeout, creationflags=CREATE_NO_WINDOW)
     out = (r.stdout + r.stderr).decode("oem" if is_windows() else "utf-8", "replace")
@@ -298,9 +401,16 @@ ConvertTo-Json -InputObject @($out) -Depth 5 -Compress
 class WindowsPlatform(Platform):
     name = "Windows"
     supports_vss = True
+    supports_offline_windows = True
+    supports_prepare_disconnect = True
 
     def __init__(self):
         self._locked_volumes: List[WinDevice] = []
+        self._win_info_cache: Dict[tuple, Optional[WindowsInfo]] = {}
+        self._pending_cache: Dict[tuple, List[str]] = {}
+        # Letras que ClonDisk asignó a cada disco destino (número de disco → letras).
+        # Se quitan por letra: mbr2gpt renumera las particiones al crear la EFI.
+        self._assigned_letters: Dict[int, Set[str]] = {}
 
     # ------------------------------------------------------------------
     def list_disks(self) -> List[Disk]:
@@ -358,6 +468,226 @@ class WindowsPlatform(Platform):
                     f"{part.letter}:\\Windows\\System32\\config\\SYSTEM")
             elif part.is_boot:
                 part.has_windows = True
+            if part.has_windows:
+                try:
+                    part.win_info = self.windows_info(part)
+                except Exception:
+                    part.win_info = None
+
+    # ------------------------------------------------------------------ versión de Windows
+    @staticmethod
+    def _read_version_key(root_key, subpath: str) -> WindowsInfo:
+        import winreg
+        with winreg.OpenKey(root_key, subpath, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as k:
+            def val(name):
+                try:
+                    return winreg.QueryValueEx(k, name)[0]
+                except OSError:
+                    return None
+            build = val("CurrentBuild") or val("CurrentBuildNumber")
+            try:
+                build = int(str(build).strip()) if build is not None else None
+            except ValueError:
+                build = None
+            return WindowsInfo(product_name=str(val("ProductName") or ""), build=build,
+                               edition=str(val("EditionID") or ""))
+
+    def windows_info(self, part: Partition) -> Optional[WindowsInfo]:
+        """Lee ProductName, CurrentBuild y EditionID. Para un Windows sin conexión se carga
+        una COPIA de su colmena SOFTWARE: el volumen de origen no se modifica."""
+        import winreg
+        if part.is_boot:
+            return self._read_version_key(winreg.HKEY_LOCAL_MACHINE,
+                                          r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+        if not part.letter:
+            return None
+        key = self._hive_cache_key(part, ("SOFTWARE",))
+        if key in self._win_info_cache:
+            return self._win_info_cache[key]
+        with self._offline_hive_copies(part.letter, ("SOFTWARE",)) as roots:
+            info = self._read_version_key(winreg.HKEY_LOCAL_MACHINE,
+                                          rf"{roots['SOFTWARE']}\Microsoft\Windows NT\CurrentVersion")
+        self._win_info_cache[key] = info
+        return info
+
+    @staticmethod
+    def _hive_cache_key(part: Partition, names) -> tuple:
+        cfg = f"{part.letter}:\\Windows\\System32\\config"
+        stats = [os.stat(os.path.join(cfg, n)) for n in names]
+        return (part.volume_path or part.letter, tuple(names),
+                tuple((st.st_size, st.st_mtime_ns) for st in stats))
+
+    @contextlib.contextmanager
+    def _offline_hive_copies(self, letter: str, names):
+        """Carga COPIAS de las colmenas de un Windows sin conexión (el origen no se modifica).
+        Devuelve {nombre: raíz bajo HKLM}."""
+        cfg = f"{letter}:\\Windows\\System32\\config"
+        td = tempfile.mkdtemp(prefix="clondisk_hv_")
+        try:
+            with contextlib.ExitStack() as stack:
+                roots = {}
+                for name in names:
+                    for suffix in ("", ".LOG1", ".LOG2"):
+                        if os.path.exists(os.path.join(cfg, name + suffix)):
+                            shutil.copyfile(os.path.join(cfg, name + suffix),
+                                            os.path.join(td, name + suffix))
+                    roots[name] = stack.enter_context(self._loaded_hive(
+                        os.path.join(td, name), f"CLONDISK_RO_{name}", lambda *a: None))
+                yield roots
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def pending_updates(self, part: Partition) -> Optional[List[str]]:
+        """Actualizaciones a medio instalar en el Windows de origen (lista vacía = ninguna)."""
+        if part.is_boot:
+            windir = os.environ.get("SystemRoot", r"C:\Windows")
+            return pending_update_reasons(WinregHive("SOFTWARE"), WinregHive("SYSTEM"), windir)
+        if not part.letter:
+            return None
+        names = ("SOFTWARE", "SYSTEM")
+        key = self._hive_cache_key(part, names)
+        if key not in self._pending_cache:
+            with self._offline_hive_copies(part.letter, names) as roots:
+                self._pending_cache[key] = pending_update_reasons(
+                    WinregHive(roots["SOFTWARE"]), WinregHive(roots["SYSTEM"]),
+                    f"{part.letter}:\\Windows")
+        return list(self._pending_cache[key])
+
+    def host_build(self) -> Optional[int]:
+        try:
+            return int(sys.getwindowsversion().build)
+        except Exception:
+            return None
+
+    def has_mbr2gpt(self) -> bool:
+        return os.path.exists(os.path.join(_system32(), "mbr2gpt.exe"))
+
+    # ------------------------------------------------------------------ salud del disco
+    def disk_health(self, disk: Disk) -> Optional[DiskHealth]:
+        script = f"""
+$pd = Get-PhysicalDisk | Where-Object {{ [string]$_.DeviceId -eq '{disk.number}' }} | Select-Object -First 1
+if ($pd) {{
+  $r = $null
+  try {{ $r = $pd | Get-StorageReliabilityCounter -ErrorAction Stop }} catch {{}}
+  [pscustomobject]@{{
+    Health = [string]$pd.HealthStatus
+    ReadErr = $(if ($r -and $r.ReadErrorsUncorrected -ne $null) {{ [int64]$r.ReadErrorsUncorrected }} else {{ $null }})
+    Temp = $(if ($r -and $r.Temperature -ne $null) {{ [int64]$r.Temperature }} else {{ $null }})
+    Wear = $(if ($r -and $r.Wear -ne $null) {{ [int64]$r.Wear }} else {{ $null }})
+  }} | ConvertTo-Json -Compress
+}}
+"""
+        data = run_ps_json(script, timeout=120)
+        if not data:
+            return None
+        h = DiskHealth(health_status=data.get("Health") or None,
+                       read_errors_uncorrected=data.get("ReadErr"),
+                       temperature=data.get("Temp"), wear=data.get("Wear"))
+        h.counters_available = any(v is not None for v in (h.read_errors_uncorrected,
+                                                           h.temperature, h.wear))
+        return h
+
+    # ------------------------------------------------------------------ Windows sin conexión
+    @staticmethod
+    def _require_offline_letter(part: Partition) -> str:
+        if part.is_boot:
+            raise CommandError(f"{part.display_name()} es el Windows en ejecución")
+        if not part.letter:
+            raise CommandError(f"{part.display_name()} no tiene letra de unidad asignada")
+        host = os.environ.get("SystemDrive", "C:")[:1].upper()
+        if part.letter.upper() == host:
+            raise CommandError(f"{part.letter}: es la unidad del sistema de este equipo")
+        return part.letter.upper()
+
+    def backup_drivers(self, part: Partition, log: LogFn) -> DriverBackup:
+        """Exporta los drivers de terceros del Windows sin conexión. Si DISM falla (p. ej.
+        porque ese Windows es más nuevo que el anfitrión) copia las carpetas del DriverStore
+        que corresponden a los oem*.inf."""
+        letter = self._require_offline_letter(part)
+        docs = _documents_dir()
+        # La carpeta destino se crea completa ANTES de llamar a DISM.
+        dest, fallback = driver_backup_dir(docs, time.strftime("%Y%m%d_%H%M%S"))
+        if fallback:
+            log(f"No se pudo crear la carpeta en Documentos ({docs or 'desconocida'}); suele "
+                "deberse al «Acceso controlado a carpetas» de Windows Defender. El respaldo se "
+                f"guarda en {dest}", "warn")
+        dism = os.path.join(_system32(), "dism.exe")
+        cmd = f'"{dism}" /English /Image:{letter}:\\ /Export-Driver /Destination:"{dest}"'
+        r = subprocess.run(cmd, capture_output=True, timeout=3600, creationflags=CREATE_NO_WINDOW)
+        out = (r.stdout + r.stderr).decode("oem", "replace").strip()
+        infs = count_inf_files(dest) if r.returncode == 0 else 0
+        if infs:
+            log(f"DISM exportó {infs} driver(s) (.inf) a {dest}")
+            return DriverBackup(dest, infs, "dism", used_fallback_dir=fallback)
+        if r.returncode == 0:
+            log("DISM terminó sin errores pero no exportó ningún .inf", "warn")
+        else:
+            log(f"DISM /export-driver falló (código {r.returncode}): {out[-600:]}", "warn")
+        log("Se usa el respaldo alternativo: copia de carpetas del DriverStore", "warn")
+        backup = self._backup_driverstore(letter, dest, log)
+        backup.used_fallback_dir = fallback
+        return backup
+
+    def _backup_driverstore(self, letter: str, dest: str, log: LogFn) -> DriverBackup:
+        inf_dir = f"{letter}:\\Windows\\INF"
+        repo = f"{letter}:\\Windows\\System32\\DriverStore\\FileRepository"
+        oem: Dict[str, str] = {}
+        sizes = set()
+        for name in os.listdir(inf_dir):
+            if re.fullmatch(r"oem\d+\.inf", name, re.IGNORECASE):
+                path = os.path.join(inf_dir, name)
+                oem[name] = _file_digest(path)
+                sizes.add(os.path.getsize(path))
+        repo_digests: Dict[str, List[str]] = {}
+        for folder in os.listdir(repo):
+            fp = os.path.join(repo, folder)
+            if not os.path.isdir(fp):
+                continue
+            digests = []
+            for f in os.listdir(fp):
+                path = os.path.join(fp, f)
+                if f.lower().endswith(".inf") and os.path.getsize(path) in sizes:
+                    digests.append(_file_digest(path))
+            repo_digests[folder] = digests
+        found, missing = match_oem_driver_folders(oem, repo_digests)
+        for folder in sorted(set(found.values())):
+            shutil.copytree(os.path.join(repo, folder), os.path.join(dest, folder), dirs_exist_ok=True)
+        with open(os.path.join(dest, "indice_oem.txt"), "w", encoding="utf-8") as f:
+            for name, folder in found.items():
+                f.write(f"{name}\t{folder}\n")
+            for name in missing:
+                f.write(f"{name}\t(no encontrado en FileRepository)\n")
+        count = len(set(found.values()))
+        if missing:
+            log(f"{len(missing)} oem*.inf sin carpeta en el DriverStore: {', '.join(missing)}", "warn")
+        if not oem:
+            raise CommandError(f"No hay drivers de terceros (oem*.inf) en {inf_dir}")
+        if not count:
+            raise CommandError("No se pudo emparejar ningún oem*.inf con el DriverStore")
+        log(f"Copiadas {count} carpeta(s) de drivers del DriverStore a {dest}")
+        return DriverBackup(dest, count, "driverstore", missing)
+
+    def prepare_offline_volume(self, disk: Disk, part: Partition, log: LogFn) -> List[str]:
+        """Borra hiberfil/pagefile/swapfile y las instantáneas del volumen de un Windows
+        que NO está en ejecución, para que Windows pueda reducirlo más."""
+        letter = self._require_offline_letter(part)
+        done: List[str] = []
+        for name in ("hiberfil.sys", "pagefile.sys", "swapfile.sys"):
+            path = f"{letter}:\\{name}"
+            if not os.path.exists(path):
+                continue
+            size = os.path.getsize(path)
+            run_ps(f"Remove-Item -LiteralPath {ps_str(path)} -Force")
+            done.append(f"Eliminado {path} ({fmt_size(size)})")
+        r = subprocess.run([os.path.join(_system32(), "vssadmin.exe"), "delete", "shadows",
+                            f"/for={letter}:", "/quiet"],
+                           capture_output=True, timeout=600, creationflags=CREATE_NO_WINDOW)
+        out = (r.stdout + r.stderr).decode("oem", "replace").strip()
+        done.append(f"Instantáneas de {letter}: eliminadas" if r.returncode == 0 else
+                    f"Instantáneas de {letter}: ninguna eliminada ({out or r.returncode})")
+        for d in done:
+            log(d)
+        return done
 
     def open_disk(self, disk: Disk, write: bool = False) -> Device:
         return WinDevice(rf"\\.\PhysicalDrive{disk.number}", write=write,
@@ -388,12 +718,44 @@ class WindowsPlatform(Platform):
             run_ps(f"Set-Disk -Number {n} -IsReadOnly $false")
             log("Se quitó el atributo de solo lectura del destino")
         if not info.get("IsOffline"):
+            # Bloquear y desmontar los volúmenes mientras aún están montados; los handles
+            # quedan abiertos hasta bring_online() para que Windows no los vuelva a montar.
+            self._lock_volumes(disk, log)
             try:
                 run_ps(f"Set-Disk -Number {n} -IsOffline $true")
                 log(f"Disco {n} desconectado (offline) para escritura directa")
             except CommandError as e:
-                log(f"No se pudo poner offline el disco ({e}); se bloquearán sus volúmenes", "warn")
-                self._lock_volumes(disk, log)
+                log(f"No se pudo poner offline el disco ({e}); sus volúmenes siguen bloqueados", "warn")
+        self._delete_layout(disk, log)
+
+    def _delete_layout(self, disk: Disk, log: LogFn):
+        """Borra la tabla de particiones del destino para que Windows no tenga volúmenes en él."""
+        try:
+            with WinDevice(rf"\\.\PhysicalDrive{disk.number}", write=True,
+                           sector_size=disk.sector_size) as dev:
+                dev.ioctl(IOCTL_DISK_DELETE_DRIVE_LAYOUT)
+                dev.ioctl(IOCTL_DISK_UPDATE_PROPERTIES, check=False)
+            log(f"Tabla de particiones del Disco {disk.number} eliminada (IOCTL_DISK_DELETE_DRIVE_LAYOUT)")
+        except DeviceError as e:
+            log(f"No se pudo borrar el layout con IOCTL ({e}); se sobrescribirá al copiar", "warn")
+
+    def write_denied_diagnosis(self, disk: Disk) -> str:
+        status = self.controlled_folder_access()
+        return write_denied_advice(status.mode if status else None, sys.executable)
+
+    # ------------------------------------------------------------------ Acceso controlado a carpetas
+    def controlled_folder_access(self) -> Optional[CfaStatus]:
+        try:
+            out = run_ps("Get-MpPreference | Select-Object EnableControlledFolderAccess,"
+                         "ControlledFolderAccessAllowedApplications | ConvertTo-Json -Compress",
+                         timeout=60)
+        except CommandError:
+            return None
+        return parse_cfa_preference(out, sys.executable)
+
+    def allow_controlled_folder_access(self, exe: str) -> None:
+        run_ps(f"Add-MpPreference -ControlledFolderAccessAllowedApplications {ps_str(exe)}",
+               timeout=120)
 
     def _lock_volumes(self, disk: Disk, log: LogFn):
         for p in disk.partitions:
@@ -475,7 +837,7 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                 code = int(m.group(1))
                 msg = VSS_ERRORS.get(code, f"código {code}")
             raise CommandError(
-                f"No se pudo crear la instantánea VSS de {part.display_name()}: {msg}. "
+                f"No se pudo crear la instantánea VSS de {part.display_name()} ({msg}). "
                 "Comprueba que el servicio «Instantáneas de volumen» esté habilitado y que haya "
                 "espacio libre suficiente.") from None
         dev = WinDevice(info["Device"], sector_size=sector_size, extended_dasd=True)
@@ -502,7 +864,7 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                 run_diskpart([f"select volume {letter}", "extend filesystem"])
             finally:
                 if tmp:
-                    self._remove_letter(disk, pn, letter, log)
+                    self._remove_letter(disk, letter, log)
         sizes = run_ps_json(
             f"$p = Get-Partition -DiskNumber {disk.number} -PartitionNumber {pn}; $v = $p | Get-Volume; "
             "[pscustomobject]@{P=[uint64]$p.Size; V=[uint64]$v.Size} | ConvertTo-Json -Compress")
@@ -530,21 +892,88 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
                    f"-AccessPath '{letter}:\\'")
         except CommandError:
             run_diskpart([f"select disk {disk.number}", f"select partition {pn}", f"assign letter={letter}"])
+        self._assigned_letters.setdefault(disk.number, set()).add(letter)
         for _ in range(20):
             if os.path.exists(f"{letter}:\\"):
                 break
             time.sleep(0.5)
         return letter, True, pn
 
-    def _remove_letter(self, disk: Disk, pn: int, letter: str, log: LogFn):
+    def _remove_letter(self, disk: Disk, letter: str, log: LogFn) -> bool:
+        """Quita una letra del disco destino buscándola POR LETRA (no por número de
+        partición, que cambia con mbr2gpt). Solo toca particiones de ``disk``."""
+        letter = letter.upper()[:1]
+        script = f"""
+$p = @(Get-Partition -DiskNumber {disk.number} -ErrorAction SilentlyContinue |
+       Where-Object {{ [string]$_.DriveLetter -eq '{letter}' }})
+if ($p.Count -eq 0) {{ 'ausente' }} else {{
+  try {{ $p[0] | Remove-PartitionAccessPath -AccessPath '{letter}:\\' -ErrorAction Stop; 'quitada' }}
+  catch {{ 'error: ' + $_.Exception.Message }}
+}}
+"""
         try:
-            run_diskpart([f"select disk {disk.number}", f"select partition {pn}",
-                          f"remove letter={letter}"])
+            out = run_ps(script, timeout=120).strip()
         except CommandError as e:
             log(f"No se pudo quitar la letra {letter}: ({e})", "warn")
+            return False
+        removed = out.startswith("quitada") or out.startswith("ausente")
+        if out.startswith("error"):
+            # La letra es de este disco pero Remove-PartitionAccessPath falló: mountvol.
+            try:
+                run_exe([os.path.join(_system32(), "mountvol.exe"), f"{letter}:", "/D"])
+                removed = True
+            except CommandError as e:
+                log(f"No se pudo quitar la letra {letter}: ({out[7:]}; mountvol: {e})", "warn")
+        if removed:
+            self._assigned_letters.get(disk.number, set()).discard(letter)
+            if out.startswith("ausente"):
+                log(f"Letra temporal {letter}: ya no estaba asignada en el Disco {disk.number}")
+        return removed
+
+    def release_target_letters(self, disk: Disk, log: LogFn) -> List[str]:
+        """Quita todas las letras que ClonDisk asignó al destino. Devuelve las que quedan."""
+        pending = sorted(self._assigned_letters.get(disk.number, set()))
+        for letter in pending:
+            self._remove_letter(disk, letter, log)
+        left = sorted(self._assigned_letters.get(disk.number, set()))
+        if pending and not left:
+            log(f"Letras temporales quitadas del destino: {', '.join(l + ':' for l in pending)}")
+        return left
+
+    def prepare_disconnect(self, disk: Disk, log: LogFn) -> List[str]:
+        """Vacía la caché de escritura de cada volumen, quita todas las letras del disco y
+        lo deja offline para poder retirarlo sin que Windows diga que está en uso."""
+        n = disk.number
+        script = f"""
+$d = Get-Disk -Number {n}
+if ($d.IsBoot -or $d.IsSystem) {{ throw 'El Disco {n} es el disco del sistema en ejecución' }}
+$out = @()
+foreach ($p in @(Get-Partition -DiskNumber {n} -ErrorAction SilentlyContinue)) {{
+  $v = $null
+  try {{ $v = $p | Get-Volume -ErrorAction Stop }} catch {{}}
+  $name = "partición $($p.PartitionNumber)"
+  if ($v) {{
+    try {{ $v | Write-VolumeCache -ErrorAction Stop; $out += "Caché escrita: $name" }}
+    catch {{ $out += "Caché de $name`: $($_.Exception.Message)" }}
+  }}
+  $l = [string]$p.DriveLetter
+  if ($l -and [int][char]$l -ne 0) {{
+    try {{ $p | Remove-PartitionAccessPath -AccessPath "$($l):\\" -ErrorAction Stop; $out += "Letra $($l): quitada" }}
+    catch {{ $out += "Letra $($l): no se pudo quitar: $($_.Exception.Message)" }}
+  }}
+}}
+if (-not $d.IsOffline) {{ Set-Disk -Number {n} -IsOffline $true; $out += 'Disco {n} offline' }}
+else {{ $out += 'Disco {n} ya estaba offline' }}
+ConvertTo-Json -InputObject @($out) -Compress
+"""
+        lines = [str(x) for x in (run_ps_json(script, timeout=300) or [])]
+        self._assigned_letters.pop(n, None)
+        for line in lines:
+            log(line)
+        return lines
 
     def make_bootable(self, disk: Disk, windows_offset: int, system_offset: int,
-                      firmware: str, log: LogFn) -> None:
+                      firmware: str, log: LogFn, win_build: Optional[int] = None) -> None:
         win, win_tmp, win_pn = self._ensure_letter(disk, windows_offset)
         sysl, sys_tmp, sys_pn = (win, False, win_pn) if system_offset == windows_offset else \
             self._ensure_letter(disk, system_offset)
@@ -552,62 +981,268 @@ $s = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object {{ $_.ID -eq $r.
             if not os.path.exists(f"{win}:\\Windows\\System32\\winload.efi") and \
                     not os.path.exists(f"{win}:\\Windows\\System32\\winload.exe"):
                 raise CommandError(f"No se encontró Windows en {win}:")
-            args = [os.path.join(_system32(), "bcdboot.exe"), f"{win}:\\Windows",
-                    "/s", f"{sysl}:", "/f", firmware]
+            host_exe = os.path.join(_system32(), "bcdboot.exe")
+            target_exe = f"{win}:\\Windows\\System32\\bcdboot.exe"
+            exe, why = choose_bcdboot(self.host_build(), win_build, host_exe, target_exe,
+                                      os.path.exists(target_exe))
+            log(f"bcdboot: {why} → {exe}")
+            args = [f"{win}:\\Windows", "/s", f"{sysl}:", "/f", firmware]
             if firmware == "UEFI":
                 args.append("/addlast")  # no cambia el orden de arranque actual
-            out = run_exe(args)
+            try:
+                out = run_exe([exe] + args)
+            except CommandError as e:
+                if exe == host_exe:
+                    raise
+                log(f"El bcdboot del Windows clonado falló ({e}); se reintenta con el del "
+                    f"anfitrión: {host_exe}", "warn")
+                out = run_exe([host_exe] + args)
             log(f"bcdboot: {out.strip()}")
+            for note in bcdboot_warnings(out):
+                log(note, "warn")
         finally:
             if sys_tmp:
-                self._remove_letter(disk, sys_pn, sysl, log)
+                self._remove_letter(disk, sysl, log)
             if win_tmp:
-                self._remove_letter(disk, win_pn, win, log)
+                self._remove_letter(disk, win, log)
+
+    @contextlib.contextmanager
+    def _loaded_hive(self, hive_file: str, hive_name: str, log: LogFn):
+        """Carga ``hive_file`` en ``HKLM\\<hive_name>`` y la descarga al salir."""
+        reg = os.path.join(_system32(), "reg.exe")
+        try:  # restos de una ejecución anterior interrumpida
+            run_exe([reg, "unload", f"HKLM\\{hive_name}"])
+        except CommandError:
+            pass
+        run_exe([reg, "load", f"HKLM\\{hive_name}", hive_file])
+        try:
+            yield hive_name
+        finally:
+            gc.collect()
+            for attempt in range(5):
+                try:
+                    run_exe([reg, "unload", f"HKLM\\{hive_name}"])
+                    break
+                except CommandError:
+                    time.sleep(1)
+            else:
+                log(f"No se pudo descargar HKLM\\{hive_name}; reinicia antes de usar el SSD", "warn")
+
+    @contextlib.contextmanager
+    def _target_system_hive(self, disk: Disk, windows_offset: int, log: LogFn):
+        win, win_tmp, win_pn = self._ensure_letter(disk, windows_offset)
+        try:
+            hive = f"{win}:\\Windows\\System32\\config\\SYSTEM"
+            with self._loaded_hive(hive, "CLONDISK_SYS", log) as root:
+                yield root
+        finally:
+            if win_tmp:
+                self._remove_letter(disk, win, log)
 
     def remap_mounted_devices(self, disk: Disk, windows_offset: int,
                               mapping: List[Tuple[bytes, bytes]], log: LogFn) -> None:
         import winreg
-        win, win_tmp, win_pn = self._ensure_letter(disk, windows_offset)
-        hive_name = "CLONDISK_SYS"
-        hive = f"{win}:\\Windows\\System32\\config\\SYSTEM"
-        reg = os.path.join(_system32(), "reg.exe")
-        try:
-            try:  # restos de una ejecución anterior interrumpida
-                run_exe([reg, "unload", f"HKLM\\{hive_name}"])
-            except CommandError:
-                pass
-            run_exe([reg, "load", f"HKLM\\{hive_name}", hive])
+        with self._target_system_hive(disk, windows_offset, log) as root:
             changed = 0
-            try:
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"{hive_name}\MountedDevices", 0,
-                                    winreg.KEY_READ | winreg.KEY_WRITE) as key:
-                    values = []
-                    i = 0
-                    while True:
-                        try:
-                            values.append(winreg.EnumValue(key, i))
-                        except OSError:
-                            break
-                        i += 1
-                    lookup: Dict[bytes, bytes] = dict(mapping)
-                    for name, data, typ in values:
-                        if typ == winreg.REG_BINARY and bytes(data) in lookup:
-                            winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, lookup[bytes(data)])
-                            changed += 1
-            finally:
-                gc.collect()
-                for attempt in range(5):
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"{root}\MountedDevices", 0,
+                                winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                values = []
+                i = 0
+                while True:
                     try:
-                        run_exe([reg, "unload", f"HKLM\\{hive_name}"])
+                        values.append(winreg.EnumValue(key, i))
+                    except OSError:
                         break
-                    except CommandError:
-                        time.sleep(1)
-                else:
-                    log(f"No se pudo descargar HKLM\\{hive_name}; reinicia antes de usar el SSD", "warn")
-            log(f"MountedDevices del Windows clonado actualizado ({changed} entradas)")
+                    i += 1
+                lookup: Dict[bytes, bytes] = dict(mapping)
+                for name, data, typ in values:
+                    if typ == winreg.REG_BINARY and bytes(data) in lookup:
+                        winreg.SetValueEx(key, name, 0, winreg.REG_BINARY, lookup[bytes(data)])
+                        changed += 1
+        log(f"MountedDevices del Windows clonado actualizado ({changed} entradas)")
+
+    def prepare_new_hardware(self, disk: Disk, windows_offset: int, log: LogFn) -> None:
+        with self._target_system_hive(disk, windows_offset, log) as root:
+            changes = enable_boot_storage_drivers(WinregHive(root), log)
+        if not changes:
+            log("Los drivers de almacenamiento de arranque ya estaban habilitados")
+
+    def save_network_config(self, disk: Disk, windows_offset: int,
+                            log: LogFn) -> Optional[List[StaticIp]]:
+        """Lee las IP fijas del Windows clonado y deja en su escritorio público un .txt con
+        los datos y un .ps1 para aplicarlas a la tarjeta de red nueva."""
+        win, win_tmp, _ = self._ensure_letter(disk, windows_offset)
+        try:
+            hive = f"{win}:\\Windows\\System32\\config\\SYSTEM"
+            with self._loaded_hive(hive, "CLONDISK_SYS", log) as root:
+                ips = read_static_ips(WinregHive(root))
+            if ips:
+                desk = f"{win}:\\Users\\Public\\Desktop"
+                os.makedirs(desk, exist_ok=True)
+                stamp = time.strftime("%Y-%m-%d %H:%M")
+                for name, text in ((NETWORK_TXT_NAME, network_report_text(ips, stamp)),
+                                   (NETWORK_PS1_NAME, restore_network_script(ips, stamp))):
+                    # UTF-8 con BOM: Windows PowerShell 5.1 lee sin BOM como ANSI.
+                    with open(os.path.join(desk, name), "w", encoding="utf-8-sig", newline="") as f:
+                        f.write(text)
+                log(f"Escritorio público del Windows clonado: «{NETWORK_TXT_NAME}» y "
+                    f"«{NETWORK_PS1_NAME}»")
+            return ips
         finally:
             if win_tmp:
-                self._remove_letter(disk, win_pn, win, log)
+                self._remove_letter(disk, win, log)
+
+    # ------------------------------------------------------------------ MBR → GPT
+    def _mbr2gpt_logs(self, max_lines: int = 60) -> List[str]:
+        windir = os.environ.get("SystemRoot", r"C:\Windows")
+        lines: List[str] = []
+        for name in ("setupact.log", "setuperr.log"):
+            path = os.path.join(windir, name)
+            try:
+                with open(path, "rb") as f:
+                    text = _decode_log(f.read())
+            except OSError:
+                continue
+            tail = [ln for ln in text.splitlines() if ln.strip()][-max_lines:]
+            lines.append(f"--- {path} (últimas {len(tail)} líneas) ---")
+            lines += tail
+        return lines
+
+    def convert_to_gpt(self, disk: Disk, log: LogFn) -> None:
+        exe = os.path.join(_system32(), "mbr2gpt.exe")
+        if not os.path.exists(exe):
+            raise CommandError("No se encontró mbr2gpt.exe (requiere Windows 10 1703 o posterior)")
+        for action in ("/validate", "/convert"):
+            r = subprocess.run([exe, action, f"/disk:{disk.number}", "/allowFullOS"],
+                               capture_output=True, timeout=1800, creationflags=CREATE_NO_WINDOW)
+            out = (r.stdout + r.stderr).decode("oem", "replace").strip()
+            log(f"mbr2gpt {action}: {out}")
+            if r.returncode != 0:
+                for line in self._mbr2gpt_logs():
+                    log(line, "warn")
+                raise CommandError(f"mbr2gpt {action} falló (código {r.returncode})")
+        self._update_properties(disk)
+        run_ps(f"Update-Disk -Number {disk.number}")
+        log(f"Disco {disk.number} convertido a GPT")
+
+    # ------------------------------------------------------------------ WinRE
+    def register_winre(self, disk: Disk, windows_offset: int, recovery_offset: Optional[int],
+                       log: LogFn) -> Optional[WinreStatus]:
+        """Busca Winre.wim (partición de recuperación y, si no, Windows\\System32\\Recovery) y
+        registra su ubicación en el Windows clonado con «reagentc /setreimage /target»."""
+        win, win_tmp, _ = self._ensure_letter(disk, windows_offset)
+        rec, rec_tmp = None, False
+        try:
+            if recovery_offset is not None:
+                try:
+                    rec, rec_tmp, _ = self._ensure_letter(disk, recovery_offset)
+                except CommandError as e:
+                    log(f"No se pudo asignar una letra a la partición de recuperación: {e}", "warn")
+            candidates = []
+            if rec:
+                candidates.append((f"{rec}:\\Recovery\\WindowsRE", True))
+            candidates.append((f"{win}:\\Windows\\System32\\Recovery", False))
+            folder, in_rec = find_winre_folder(candidates)
+            if folder is None:
+                return WinreStatus(detail="no existe " + " ni ".join(
+                    os.path.join(c, "Winre.wim") for c, _ in candidates))
+            log(f"Winre.wim encontrado en {folder}")
+            reagentc = os.path.join(_system32(), "ReAgentc.exe")
+            target = f"{win}:\\Windows"
+            detail, set_ok = "", True
+            try:
+                out = run_exe([reagentc, "/setreimage", "/path", folder, "/target", target], timeout=300)
+                log(f"reagentc /setreimage: {out.strip()}")
+            except CommandError as e:
+                set_ok, detail = False, str(e)
+                log(f"reagentc /setreimage falló: {e}", "warn")
+            try:
+                log("reagentc /info: " + run_exe([reagentc, "/info", "/target", target],
+                                                 timeout=300).strip())
+            except CommandError as e:
+                log(f"reagentc /info: {e}")
+            xml_text = None
+            xml_path = f"{win}:\\Windows\\System32\\Recovery\\ReAgent.xml"
+            try:
+                with open(xml_path, "rb") as f:
+                    xml_text = _decode_log(f.read())
+                log(f"ReAgent.xml: {' '.join(xml_text.split())[:600]}")
+            except OSError as e:
+                log(f"No se pudo leer {xml_path}: {e}", "warn")
+            st = winre_status_from_xml(folder, in_rec, set_ok, xml_text)
+            st.detail = detail
+            return st
+        finally:
+            if rec_tmp:
+                self._remove_letter(disk, rec, log)
+            if win_tmp:
+                self._remove_letter(disk, win, log)
+
+    # ------------------------------------------------------------------ Secure Boot
+    def boot_signature(self, disk: Disk, efi_offset: int, log: LogFn) -> Optional[dict]:
+        """Firma Authenticode de \\EFI\\Microsoft\\Boot\\bootmgfw.efi y su cadena."""
+        efi, tmp, _ = self._ensure_letter(disk, efi_offset)
+        path = f"{efi}:\\EFI\\Microsoft\\Boot\\bootmgfw.efi"
+        script = f"""
+$s = Get-AuthenticodeSignature -LiteralPath {ps_str(path)}
+$c = $s.SignerCertificate
+$chain = @()
+if ($c) {{
+  $ch = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+  $ch.ChainPolicy.RevocationMode = 'NoCheck'
+  $ch.ChainPolicy.VerificationFlags = 'AllowUnknownCertificateAuthority'
+  [void]$ch.Build($c)
+  $chain = @($ch.ChainElements | ForEach-Object {{ [string]$_.Certificate.Subject }})
+}}
+[pscustomobject]@{{
+  Status = [string]$s.Status
+  Subject = $(if ($c) {{ [string]$c.Subject }} else {{ '' }})
+  Issuer = $(if ($c) {{ [string]$c.Issuer }} else {{ '' }})
+  Chain = $chain
+}} | ConvertTo-Json -Compress
+"""
+        try:
+            if not os.path.exists(path):
+                raise CommandError(f"no existe {path}")
+            return run_ps_json(script, timeout=120)
+        finally:
+            if tmp:
+                self._remove_letter(disk, efi, log)
+
+    # ------------------------------------------------------------------ comprobación del arranque
+    def boot_file_checks(self, disk: Disk, style: str, system_offset: int, windows_offset: int,
+                         log: LogFn, check_bcd: bool = True) -> List[Tuple[bool, str]]:
+        checks: List[Tuple[bool, str]] = []
+        sysl, sys_tmp, sys_pn = self._ensure_letter(disk, system_offset)
+        win, win_tmp, win_pn = (sysl, False, sys_pn) if windows_offset == system_offset else \
+            self._ensure_letter(disk, windows_offset)
+        try:
+            if style == "MBR":
+                bcd = f"{sysl}:\\Boot\\BCD"
+                checks.append((os.path.exists(f"{sysl}:\\bootmgr"), "bootmgr en la partición de sistema"))
+                checks.append((os.path.exists(bcd), "Boot\\BCD en la partición de sistema"))
+            else:
+                bcd = f"{sysl}:\\EFI\\Microsoft\\Boot\\BCD"
+                checks.append((os.path.exists(bcd), "\\EFI\\Microsoft\\Boot\\BCD en la partición EFI"))
+                checks.append((os.path.exists(f"{sysl}:\\EFI\\Boot\\bootx64.efi"),
+                               "\\EFI\\Boot\\bootx64.efi en la partición EFI"))
+            if check_bcd and os.path.exists(bcd):
+                try:
+                    out = run_exe([os.path.join(_system32(), "bcdedit.exe"), "/store", bcd,
+                                   "/enum", "{default}"])
+                    letters = bcdedit_partition_letters(out)
+                    ok = letters == {win.upper()}
+                    found = ", ".join(f"{x}:" for x in sorted(letters)) or "ninguna partición"
+                    checks.append((ok, f"BCD {{default}} apunta a la partición de Windows del destino "
+                                       f"({win}:)" + ("" if ok else f" — apunta a: {found}")))
+                except CommandError as e:
+                    checks.append((False, f"bcdedit no pudo leer el BCD: {e}"))
+        finally:
+            if win_tmp:
+                self._remove_letter(disk, win, log)
+            if sys_tmp:
+                self._remove_letter(disk, sysl, log)
+        return checks
 
     def retrim(self, disk: Disk, log: LogFn) -> None:
         run_ps(f"Get-Partition -DiskNumber {disk.number} | Get-Volume -ErrorAction SilentlyContinue | "

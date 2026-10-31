@@ -14,12 +14,48 @@ Reglas principales
 """
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .gpt import new_guid, usable_range
-from .model import Disk, MiB, Partition, align_down, align_up
+from .model import Disk, GiB, MiB, Partition, align_down, align_up
+
+# Lectura secuencial típica de un HDD cuando no se ha medido (bytes/s): rango lento–rápido.
+HDD_READ_RANGE = (80 * MiB, 130 * MiB)
+POST_COPY_MINUTES = 2      # tabla, bcdboot, mbr2gpt, comprobaciones, TRIM
+
+
+def estimate_minutes(copy_bytes: int, verify: bool,
+                     read_bps: Optional[float] = None) -> Tuple[int, int]:
+    """Rango (mín, máx) de minutos. Verificar vuelve a leer todo: dobla el tiempo de lectura.
+    Con una velocidad medida (``read_bps``) el rango se estrecha; el interior de un HDD es
+    más lento que su principio, de ahí el margen hacia abajo."""
+    passes = 2 if verify else 1
+    if read_bps and read_bps > 0:
+        slow, fast = read_bps * 0.75, read_bps
+    else:
+        slow, fast = HDD_READ_RANGE
+    lo = copy_bytes * passes / fast / 60
+    hi = copy_bytes * passes / slow / 60 + POST_COPY_MINUTES
+    return max(1, math.floor(lo)), max(1, math.ceil(hi))
+
+
+def fmt_minutes_range(lo: int, hi: int) -> str:
+    if lo >= hi:
+        return f"~{lo} min"
+    if hi >= 120:
+        return f"{lo / 60:.1f}–{hi / 60:.1f} h"
+    return f"{lo}–{hi} min"
+
+
+def fmt_shortfall(n_bytes: int) -> str:
+    """Espacio que falta, redondeado hacia arriba: «354 GB», «512 MB»."""
+    if n_bytes >= GiB:
+        return f"{math.ceil(n_bytes / GiB)} GB"
+    return f"{max(1, math.ceil(n_bytes / MiB))} MB"
+
 
 UNSUPPORTED_ROLES = {
     "ldm": "Los discos dinámicos (LDM) no son compatibles",
@@ -37,6 +73,10 @@ class CloneOptions:
     fix_boot: bool = True         # bcdboot + MountedDevices (modo "new")
     retrim: bool = True           # TRIM al final en el destino
     dry_run: bool = False         # simulación sin escribir
+    skip_bad_sectors: bool = False  # sectores ilegibles → ceros (si no, se aborta)
+    backup_drivers: bool = False  # exportar drivers del Windows de origen (asistente)
+    convert_to_gpt: bool = False  # origen MBR → mbr2gpt al terminar (GPT/UEFI)
+    new_hardware: bool = False    # habilitar drivers de almacenamiento de arranque
 
 
 @dataclass
@@ -86,7 +126,16 @@ class ClonePlan:
 
     @property
     def firmware(self) -> str:
+        """Firmware para el que se ejecuta bcdboot (antes de una posible conversión)."""
         return "UEFI" if self.source.style == "GPT" else "BIOS"
+
+    @property
+    def converts_to_gpt(self) -> bool:
+        return self.options.convert_to_gpt and self.source.style == "MBR"
+
+    @property
+    def final_firmware(self) -> str:
+        return "UEFI" if self.converts_to_gpt else self.firmware
 
     def by_src_index(self, index: int) -> Optional[PlannedPartition]:
         for pp in self.parts:
@@ -142,6 +191,18 @@ def default_resizable(disk: Disk) -> Optional[int]:
     return max(cands, key=lambda p: p.sectors).index
 
 
+def shrink_target_bytes(plan: ClonePlan) -> Optional[int]:
+    """Tamaño (bytes, múltiplo de 1 MiB) al que hay que reducir la partición ajustable
+    del origen para que quepa en el destino; ``None`` si no hace falta o no se puede."""
+    if not plan.deficit_sectors or plan.resizable_index is None:
+        return None
+    part = plan.source.partition_by_index(plan.resizable_index)
+    if part is None:
+        return None
+    ss = plan.source.sector_size
+    return ((part.sectors - plan.deficit_sectors) * ss // MiB) * MiB
+
+
 def resizable_candidates(disk: Disk) -> List[Partition]:
     return [p for p in disk.partitions if p.fs == "NTFS" and p.role == "data"]
 
@@ -176,6 +237,11 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
                 "Desactiva BitLocker (descifrado completo) antes de clonar.")
     for prob in source.problems:
         warn(prob)
+    if options.convert_to_gpt and source.style == "MBR":
+        if options.id_mode == "same":
+            err("La conversión a GPT/UEFI requiere el modo «Nuevos identificadores»")
+        elif not options.fix_boot:
+            err("La conversión a GPT/UEFI requiere reconstruir el arranque (bcdboot)")
     if plan.errors:
         return plan
 
@@ -190,6 +256,9 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
         first_pos = align_up(first_usable, align)
     else:
         limit = min(total, 0xFFFFFFFF + 1)
+        if options.convert_to_gpt:
+            # mbr2gpt necesita espacio libre al final para la GPT de respaldo.
+            limit = min(limit, align_down(total, align) - align)
         first_pos = align
         if total > 0xFFFFFFFF + 1:
             warn("El destino supera 2 TiB y el origen es MBR: el espacio por encima "
@@ -236,10 +305,10 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
             target_size = orig + free
             if used is not None and target_size * ss < used + margin:
                 err("El destino es demasiado pequeño incluso reduciendo la partición "
-                    f"{res_part.display_name()}: faltan "
-                    f"{((min_needed - target_size) * ss) // MiB} MiB")
+                    f"{res_part.display_name()} (faltan "
+                    f"{fmt_shortfall((min_needed - target_size) * ss)})")
             else:
-                err(f"El destino es {((-free) * ss) // MiB} MiB más pequeño de lo necesario. "
+                err(f"El destino es demasiado pequeño: faltan {fmt_shortfall(-free * ss)}. "
                     f"Reduce primero la partición {res_part.display_name()} del origen "
                     "(botón «Reducir partición de origen»).")
             return plan
@@ -248,7 +317,7 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
         sizes[res_part.index] = chosen
     elif free < 0:
         plan.deficit_sectors = -free
-        err(f"El destino es {((-free) * ss) // MiB} MiB más pequeño de lo necesario y no "
+        err(f"El destino es demasiado pequeño: faltan {fmt_shortfall(-free * ss)} y no "
             "hay ninguna partición NTFS que pueda ajustarse")
         return plan
 

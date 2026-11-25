@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from .bitlocker import REENABLE_HINT
 from .model import Disk, Partition
 
 MBR2GPT_MIN_HOST_BUILD = 15063     # Windows 10 1703
@@ -550,8 +551,9 @@ def classify_boot_signature(issuer: Optional[str], chain: Iterable[str] = ()) ->
 # ---------------------------------------------------------------------------
 # Lista posterior a la migración
 # ---------------------------------------------------------------------------
-def post_migration_checklist(uefi: bool) -> List[str]:
-    """Qué revisar en el equipo nuevo (asistente, pantalla final y README)."""
+def post_migration_checklist(uefi: bool, bitlocker: bool = False) -> List[str]:
+    """Qué revisar en el equipo nuevo (asistente, pantalla final y README). ``bitlocker``: el
+    origen se descifró para clonarlo (hay que reactivar BitLocker en el SSD)."""
     items = []
     if uefi:
         items.append("Secure Boot: " + SECURE_BOOT_HELP)
@@ -569,8 +571,10 @@ def post_migration_checklist(uefi: bool) -> List[str]:
         f"«{NETWORK_TXT_NAME}» y «{NETWORK_PS1_NAME}»).",
         "Reactivación: Windows y el software con licencia pueden pedir reactivarse por el "
         "cambio de hardware.",
-        "Guarda el disco de origen sin borrarlo unas semanas, hasta comprobar que todo funciona.",
     ]
+    if bitlocker:
+        items.append(REENABLE_HINT)
+    items.append("Guarda el disco de origen sin borrarlo unas semanas, hasta comprobar que todo funciona.")
     return items
 
 

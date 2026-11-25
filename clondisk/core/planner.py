@@ -77,6 +77,7 @@ class CloneOptions:
     backup_drivers: bool = False  # exportar drivers del Windows de origen (asistente)
     convert_to_gpt: bool = False  # origen MBR → mbr2gpt al terminar (GPT/UEFI)
     new_hardware: bool = False    # habilitar drivers de almacenamiento de arranque
+    bitlocker_decrypted: bool = False  # el asistente descifró BitLocker en el origen
 
 
 @dataclass
@@ -233,8 +234,11 @@ def build_plan(source: Disk, target: Disk, options: CloneOptions,
         if p.role in UNSUPPORTED_ROLES:
             err(UNSUPPORTED_ROLES[p.role])
         if p.fs == "BitLocker":
-            err(f"La partición {p.display_name()} está cifrada con BitLocker. "
-                "Desactiva BitLocker (descifrado completo) antes de clonar.")
+            drive = f"{p.letter}:" if p.letter else "C:"
+            err(f"La partición {p.display_name()} está cifrada con BitLocker. Hay que descifrarla "
+                "por completo antes de clonar (suspender BitLocker no basta: los datos siguen "
+                "cifrados en el disco). Usa el botón «Descifrar…» del paso «Disco de origen» o "
+                f"ejecuta como administrador «manage-bde -off {drive}».")
     for prob in source.problems:
         warn(prob)
     if options.convert_to_gpt and source.style == "MBR":

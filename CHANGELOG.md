@@ -26,6 +26,14 @@
 - **IP fijas** de la tarjeta de red anterior: se muestran al final y se guardan en el escritorio público del clon (`ClonDisk - red anterior.txt` y `ClonDisk-restaurar-red.ps1`).
 - **Lista posterior a la migración** en el Resumen, en la pantalla final y en el README.
 
+### BitLocker en el origen
+
+- El paso «Disco de origen» consulta por WMI (`Win32_EncryptableVolume`, independiente del idioma) el estado de cada volumen BitLocker: cifrado, protección suspendida, descifrándose con el porcentaje restante, o bloqueado. «Siguiente» queda deshabilitado mientras el origen tenga particiones BitLocker, también si viene preseleccionado desde «Clonar este disco…».
+- **Descifrar…** (con confirmación que aclara que se modifica el disco de ORIGEN) llama a `Decrypt`. Los errores conocidos se explican con su código (volumen bloqueado, no cifrado, desbloqueo automático de unidades de datos → `manage-bde -autounlock -clearallkeys`).
+- Mientras se descifra, el estado se consulta cada 20 s y se estima el tiempo restante. Al terminar se vuelven a leer los discos (el sector de arranque debe ser NTFS) y se avisa que ya se puede continuar.
+- Sin soporte o sin datos de WMI, el aviso da los pasos manuales (`manage-bde -off` y `-status`). El error del planificador menciona el botón «Descifrar…» y que suspender no basta.
+- Si se descifró desde el asistente, la lista posterior a la migración incluye reactivar BitLocker en el SSD (`manage-bde -on C: -UsedSpaceOnly`), guardar la nueva clave y cifrar o borrar el disco de origen.
+
 ## 1.0.0
 
 - Primera versión pública.

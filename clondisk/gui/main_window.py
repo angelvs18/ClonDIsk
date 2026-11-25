@@ -31,7 +31,8 @@ partición de Windows al tamaño del SSD.</li>
 </ol>
 <h3>Limitaciones</h3>
 <ul>
-<li>No admite discos dinámicos, Espacios de almacenamiento, particiones lógicas MBR ni BitLocker activo.</li>
+<li>No admite discos dinámicos, Espacios de almacenamiento ni particiones lógicas MBR.</li>
+<li>BitLocker: el origen debe descifrarse por completo (suspenderlo no basta); el asistente ofrece descifrarlo y avisa cuando termina.</li>
 <li>Origen y destino deben tener el mismo tamaño de sector lógico (512 o 4096 B).</li>
 <li>Para clonar a un disco más pequeño, primero se reduce la partición de origen con las herramientas de Windows.</li>
 </ul>

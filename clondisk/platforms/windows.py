@@ -21,6 +21,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
+from ..core.bitlocker import BitLockerVolume, decrypt_error_text, parse_bitlocker_volumes
 from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
 from ..core.model import Disk, Partition, WindowsInfo, fmt_size
@@ -398,8 +399,57 @@ ConvertTo-Json -InputObject @($out) -Depth 5 -Compress
 """
 
 
+BITLOCKER_NS = r"root\cimv2\Security\MicrosoftVolumeEncryption"
+
+# Estado BitLocker por partición del disco {disk}. Cada método WMI va en su propio try: un
+# volumen bloqueado (o un método que falle) no debe tumbar la consulta de los demás.
+BITLOCKER_STATUS_PS = r"""
+$ns = '__NS__'
+$vols = @{}
+foreach ($v in @(Get-CimInstance -Namespace $ns -ClassName Win32_EncryptableVolume)) {
+  $vols[[string]$v.DeviceID] = $v
+}
+$out = @()
+foreach ($p in @(Get-Partition -DiskNumber __DISK__ -ErrorAction SilentlyContinue)) {
+  $v = $null
+  foreach ($ap in @($p.AccessPaths)) {
+    if ($ap -and $vols.ContainsKey([string]$ap)) { $v = $vols[[string]$ap]; break }
+  }
+  if (-not $v) { continue }
+  $conv = $null; $pct = $null; $lock = $null; $rp = $null
+  try {
+    $r = Invoke-CimMethod -InputObject $v -MethodName GetConversionStatus -Arguments @{PrecisionFactor=[uint32]1}
+    if ($r.ReturnValue -eq 0) { $conv = [int]$r.ConversionStatus; $pct = [double]$r.EncryptionPercentage / 10 }
+  } catch {}
+  try {
+    $r = Invoke-CimMethod -InputObject $v -MethodName GetLockStatus
+    if ($r.ReturnValue -eq 0) { $lock = [int]$r.LockStatus }
+  } catch {}
+  try {
+    $r = Invoke-CimMethod -InputObject $v -MethodName GetKeyProtectors -Arguments @{KeyProtectorType=[uint32]3}
+    if ($r.ReturnValue -eq 0) { $rp = @($r.VolumeKeyProtectorID | Where-Object { $_ }).Count }
+  } catch {}
+  $out += [pscustomobject]@{
+    Offset = [uint64]$p.Offset; DeviceID = [string]$v.DeviceID; DriveLetter = [string]$v.DriveLetter
+    Conversion = $conv; Percent = $pct; Protection = $(if ($v.ProtectionStatus -ne $null) { [int]$v.ProtectionStatus } else { $null })
+    Lock = $lock; RecoveryPasswords = $rp
+  }
+}
+ConvertTo-Json -InputObject @($out) -Compress
+"""
+
+BITLOCKER_DECRYPT_PS = r"""
+$v = @(Get-CimInstance -Namespace '__NS__' -ClassName Win32_EncryptableVolume |
+       Where-Object { [string]$_.DeviceID -eq __ID__ })
+if ($v.Count -eq 0) { throw 'No se encontró el volumen BitLocker' }
+$r = Invoke-CimMethod -InputObject $v[0] -MethodName Decrypt
+[string][uint32]$r.ReturnValue
+"""
+
+
 class WindowsPlatform(Platform):
     name = "Windows"
+    supports_bitlocker = True
     supports_vss = True
     supports_offline_windows = True
     supports_prepare_disconnect = True
@@ -756,6 +806,29 @@ if ($pd) {{
     def allow_controlled_folder_access(self, exe: str) -> None:
         run_ps(f"Add-MpPreference -ControlledFolderAccessAllowedApplications {ps_str(exe)}",
                timeout=120)
+
+    # ------------------------------------------------------------------ BitLocker en el origen
+    def bitlocker_status_raw(self, disk: Disk) -> str:
+        script = BITLOCKER_STATUS_PS.replace("__NS__", BITLOCKER_NS).replace("__DISK__", str(int(disk.number)))
+        return run_ps(script, timeout=120)
+
+    def bitlocker_status(self, disk: Disk) -> Optional[List[BitLockerVolume]]:
+        try:
+            return parse_bitlocker_volumes(self.bitlocker_status_raw(disk))
+        except (CommandError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+    def decrypt_bitlocker(self, vol: BitLockerVolume, log: LogFn) -> None:
+        drive = f"{vol.letter}:" if vol.letter else vol.device_id
+        log(f"Descifrando BitLocker en {drive}")
+        script = BITLOCKER_DECRYPT_PS.replace("__NS__", BITLOCKER_NS).replace("__ID__", ps_str(vol.device_id))
+        out = run_ps(script, timeout=120).strip()
+        try:
+            code = int(out.splitlines()[-1]) if out else -1
+        except ValueError:
+            raise CommandError(f"Respuesta inesperada de Decrypt: {out}")
+        if code != 0:
+            raise CommandError(decrypt_error_text(code, drive))
 
     def _lock_volumes(self, disk: Disk, log: LogFn):
         for p in disk.partitions:

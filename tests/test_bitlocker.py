@@ -290,3 +290,51 @@ def test_wizard_shows_query_error_detail(app):
         assert not w.btn_next.isEnabled() and w.btn_bl_decrypt.isHidden()
     finally:
         w.close()
+
+
+def test_wizard_partial_decrypt_failure(app, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from clondisk.gui.wizard import CloneWizard
+    from clondisk.platforms.base import Platform
+
+    d_offset = C_OFFSET + 900 * GiB
+    src = bl_disk()
+    src.partitions.append(Partition(5, d_offset // 512, 50 * GiB // 512, type_guid=GUID_BASIC,
+                                    fs="BitLocker", letter="D"))
+
+    class TwoVolumes(Platform):
+        supports_bitlocker = True
+
+        def __init__(self):
+            self.tried = []
+            self.c_state = 1
+
+        def bitlocker_status(self, disk):
+            c = vol(self.c_state, 99.0 if self.c_state == 3 else 100.0)
+            dv = BitLockerVolume(d_offset, r"\\?\Volume{d}" + "\\", "D", 1, 100.0, 1, False, 0)
+            return [c, dv]
+
+        def decrypt_bitlocker(self, v, log):
+            self.tried.append(v.letter)
+            if v.letter == "D":
+                raise RuntimeError(decrypt_error_text(0x80310029, "D:"))
+            self.c_state = 3
+
+    plat = TwoVolumes()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: QMessageBox.Yes)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: errors.append(a[2]))
+    w = CloneWizard(plat, [src], src)
+    try:
+        _wait(app, w)
+        assert len(w.bl_report.decryptable) == 2
+        w._bl_decrypt()
+        _wait(app, w)
+        assert plat.tried == ["C", "D"]
+        assert len(errors) == 1 and "D: — " in errors[0] and "manage-bde -off D:" in errors[0]
+        assert "0x80310029" in errors[0] and "Se inició el descifrado de C:" in errors[0]
+        assert src.number in w.bl_decrypted_disks
+        assert w.bl_timer.isActive() and [p.letter for p, _v in w.bl_report.decrypting] == ["C"]
+        assert "descifrándose" in w.bl_label.text() and not w.btn_next.isEnabled()
+    finally:
+        w.close()

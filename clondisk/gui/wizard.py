@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
 
 from ..core.bitlocker import (POLL_SECONDS, BitLockerReport, assess_bitlocker,
                               bitlocker_partitions, decrypt_confirm_text, estimate_seconds_left,
-                              fmt_eta)
+                              fmt_eta, volume_arg)
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, estimate_minutes,
                             fmt_minutes_range, resizable_candidates, shrink_target_bytes)
@@ -640,15 +640,29 @@ class CloneWizard(QDialog):
             return
 
         def work():
-            for _p, v in pairs:
-                self.platform.decrypt_bitlocker(v, lambda *a: None)
+            # Cada volumen por separado: si uno falla, los demás igual se intentan.
+            started, errors = [], []
+            for p, v in pairs:
+                try:
+                    self.platform.decrypt_bitlocker(v, lambda *a: None)
+                    started.append(p.display_name())
+                except Exception as e:
+                    errors.append((p, v, str(e).strip() or type(e).__name__))
+            return started, errors
 
-        def done(_res, err):
-            if err:
-                QMessageBox.critical(self, "Descifrar BitLocker",
-                                     f"No se pudo iniciar el descifrado.\n\n{err}")
-            else:
+        def done(res, err):
+            started, errors = res if not err else ([], [(p, v, str(err)) for p, v in pairs])
+            if started:
                 self.bl_decrypted_disks.add(src.number)
+            if errors:
+                lines = "\n".join(f"• {p.display_name()} — {msg}" for p, _v, msg in errors)
+                manual = "\n".join(f"    manage-bde -off {volume_arg(p.letter or v.letter, v.device_id)}"
+                                   for p, v, _m in errors)
+                ok = f"Se inició el descifrado de {', '.join(started)}.\n\n" if started else ""
+                QMessageBox.critical(
+                    self, "Descifrar BitLocker",
+                    f"{ok}No se pudo iniciar el descifrado de:\n{lines}\n\nAlternativa: ejecuta como "
+                    f"administrador\n{manual}\ny pulsa «Actualizar estado».")
             self._bl_check(force=True)
 
         self._run_busy(work, done)

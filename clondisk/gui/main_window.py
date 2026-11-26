@@ -31,7 +31,8 @@ partición de Windows al tamaño del SSD.</li>
 </ol>
 <h3>Limitaciones</h3>
 <ul>
-<li>No admite discos dinámicos, Espacios de almacenamiento, particiones lógicas MBR ni BitLocker activo.</li>
+<li>No admite discos dinámicos, Espacios de almacenamiento ni particiones lógicas MBR.</li>
+<li>BitLocker: el origen debe descifrarse por completo (suspenderlo no basta); el asistente ofrece descifrarlo y avisa cuando termina.</li>
 <li>Origen y destino deben tener el mismo tamaño de sector lógico (512 o 4096 B).</li>
 <li>Para clonar a un disco más pequeño, primero se reduce la partición de origen con las herramientas de Windows.</li>
 </ul>
@@ -128,6 +129,9 @@ class MainWindow(QMainWindow):
         t.setObjectName("PageTitle")
         s = QLabel("Elige «Clonar este disco…» en el disco de origen (tu HDD actual).")
         s.setObjectName("PageSubtitle")
+        # Con ajuste de línea: si no, el subtítulo fija un ancho mínimo mayor que 1366 px.
+        t.setWordWrap(True)
+        s.setWordWrap(True)
         tl.addWidget(t)
         tl.addWidget(s)
         head.addLayout(tl, 1)
@@ -148,19 +152,18 @@ class MainWindow(QMainWindow):
         sa.setWidget(self.list_body)
         lay.addWidget(sa, 1)
 
-        legend = QHBoxLayout()
-        for name, key in (("NTFS", "ntfs"), ("FAT32", "fat"), ("Sistema EFI", "efi"),
-                          ("Reservada MSR", "msr"), ("Recuperación", "recovery"),
-                          ("BitLocker", "bitlocker"), ("Sin asignar", "free")):
-            sw = QLabel()
-            sw.setFixedSize(12, 12)
-            sw.setStyleSheet(f"background:{theme.ROLE_COLORS[key]}; border-radius:2px;")
-            legend.addWidget(sw)
-            lab = QLabel(name)
-            lab.setStyleSheet(f"color:{theme.MUTED}; font-size:9pt; margin-right:10px;")
-            legend.addWidget(lab)
-        legend.addStretch(1)
-        lay.addLayout(legend)
+        # Una sola etiqueta con ajuste de línea: una fila de widgets fijaba un ancho
+        # mínimo mayor que una pantalla de 1366 px.
+        items = [f"<span style='color:{theme.ROLE_COLORS[key]}; font-size:12pt'>■</span>"
+                 f"&nbsp;{name}"
+                 for name, key in (("NTFS", "ntfs"), ("FAT32", "fat"), ("Sistema EFI", "efi"),
+                                   ("Reservada MSR", "msr"), ("Recuperación", "recovery"),
+                                   ("BitLocker", "bitlocker"), ("Sin asignar", "free"))]
+        legend = QLabel(" &nbsp;&nbsp; ".join(items))
+        legend.setTextFormat(Qt.RichText)
+        legend.setWordWrap(True)
+        legend.setStyleSheet(f"color:{theme.MUTED}; font-size:9pt;")
+        lay.addWidget(legend)
         return page
 
     # ------------------------------------------------------------------

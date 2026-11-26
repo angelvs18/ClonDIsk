@@ -49,8 +49,11 @@ def main(argv=None) -> int:
 def _fatal(msg: str):
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
-        _app = QApplication.instance() or QApplication(sys.argv[:1])  # noqa: F841
-        QMessageBox.critical(None, "ClonDisk", msg)
+        # La referencia mantiene vivo el QApplication mientras se muestra el mensaje: sin ella
+        # el temporal se destruye antes de QMessageBox. Se usa (activeWindow) para que pyflakes,
+        # que no respeta «# noqa», no la marque como sin usar.
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        QMessageBox.critical(app.activeWindow(), "ClonDisk", msg)
     except Exception:
         print(msg, file=sys.stderr)
 

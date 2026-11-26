@@ -6,7 +6,19 @@ import threading
 
 
 class DeviceError(IOError):
-    pass
+    """Error de E/S. ``code`` es el código de error del sistema (p. ej. 5 = acceso denegado)."""
+
+    def __init__(self, msg: str = "", code: "int | None" = None):
+        super().__init__(msg)
+        self.code = code
+
+
+ERROR_ACCESS_DENIED = 5
+
+
+def is_access_denied(e: BaseException) -> bool:
+    return isinstance(e, PermissionError) or getattr(e, "code", None) == ERROR_ACCESS_DENIED \
+        or getattr(e, "winerror", None) == ERROR_ACCESS_DENIED
 
 
 class Device:

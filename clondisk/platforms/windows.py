@@ -21,7 +21,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-from ..core.bitlocker import BitLockerVolume, decrypt_error_text, parse_bitlocker_volumes
+from ..core.bitlocker import (BitLockerVolume, decrypt_error_text, parse_bitlocker_volumes,
+                              volume_arg)
 from ..core.device import Device, DeviceError
 from ..core.fs import ntfs_used_bytes
 from ..core.model import Disk, Partition, WindowsInfo, fmt_size
@@ -819,7 +820,7 @@ if ($pd) {{
             return None
 
     def decrypt_bitlocker(self, vol: BitLockerVolume, log: LogFn) -> None:
-        drive = f"{vol.letter}:" if vol.letter else vol.device_id
+        drive = volume_arg(vol.letter, vol.device_id)
         log(f"Descifrando BitLocker en {drive}")
         script = BITLOCKER_DECRYPT_PS.replace("__NS__", BITLOCKER_NS).replace("__ID__", ps_str(vol.device_id))
         out = run_ps(script, timeout=120).strip()

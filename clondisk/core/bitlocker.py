@@ -127,9 +127,20 @@ def bitlocker_partitions(disk: Optional[Disk]) -> List[Partition]:
     return [p for p in disk.partitions if p.fs == "BitLocker"] if disk else []
 
 
+UNKNOWN_DRIVE = "<unidad>:"
+
+
+def volume_arg(letter: Optional[str] = None, device_id: str = "") -> str:
+    """Cómo nombrar el volumen en ``manage-bde``: la letra («D:»), si no la ruta
+    ``\\\\?\\Volume{...}\\`` (manage-bde la acepta) y, si no hay nada, «<unidad>:».
+    Nunca se supone C:."""
+    if letter:
+        return f"{letter.rstrip(':')}:"
+    return device_id or UNKNOWN_DRIVE
+
+
 def _drive(part: Partition, vol: Optional[BitLockerVolume] = None) -> str:
-    letter = part.letter or (vol.letter if vol else None)
-    return f"{letter}:" if letter else "C:"
+    return volume_arg(part.letter or (vol.letter if vol else None), vol.device_id if vol else "")
 
 
 def _manual_steps(drive: str) -> str:
@@ -217,7 +228,7 @@ DECRYPT_ERRORS = {
 }
 
 
-def decrypt_error_text(code: int, drive: str = "C:") -> str:
+def decrypt_error_text(code: int, drive: str = UNKNOWN_DRIVE) -> str:
     code &= 0xFFFFFFFF
     msg = DECRYPT_ERRORS.get(code, "Windows no pudo iniciar el descifrado.")
     return f"{msg.format(drive=drive)} (código 0x{code:08X})"

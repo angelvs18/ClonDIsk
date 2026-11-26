@@ -239,3 +239,32 @@ def test_wizard_base_platform_manual_steps(app):
         assert not w.bl_timer.isActive()
     finally:
         w.close()
+
+
+# ---------------------------------------------------------------- correcciones de la revisión
+VOL_ABCD = r"\\?\Volume{abcd}" + "\\"
+
+
+def _no_letter_disk():
+    d = bl_disk()
+    d.partitions[0].letter = None
+    return d
+
+
+def test_partition_without_letter_never_says_c():
+    d = _no_letter_disk()
+    part = d.partitions[0]
+    with_vol = BitLockerVolume(C_OFFSET, VOL_ABCD, None, 1, 100.0, 1, False, 1)
+    texts = []
+    for vols in (None, [], [with_vol]):
+        texts += assess_bitlocker(d, vols).lines
+    texts.append(decrypt_confirm_text(d, [(part, with_vol)]))
+    texts.append(decrypt_error_text(0x80310029))
+    for t in texts:
+        assert "C:" not in t, t
+    joined = " ".join(assess_bitlocker(d, None).lines)
+    assert "manage-bde -off <unidad>:" in joined
+    assert VOL_ABCD in decrypt_confirm_text(d, [(part, with_vol)])
+    locked = BitLockerVolume(C_OFFSET, VOL_ABCD, None, 7, None, 2, False, 0)
+    assert "manage-bde -off " + VOL_ABCD in " ".join(assess_bitlocker(d, [locked]).lines)
+    assert "<unidad>:" in decrypt_error_text(0x80310029)

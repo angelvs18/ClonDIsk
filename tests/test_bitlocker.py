@@ -268,3 +268,25 @@ def test_partition_without_letter_never_says_c():
     locked = BitLockerVolume(C_OFFSET, VOL_ABCD, None, 7, None, 2, False, 0)
     assert "manage-bde -off " + VOL_ABCD in " ".join(assess_bitlocker(d, [locked]).lines)
     assert "<unidad>:" in decrypt_error_text(0x80310029)
+
+
+def test_wizard_shows_query_error_detail(app):
+    from clondisk.gui.wizard import CloneWizard
+    from clondisk.platforms.base import Platform
+
+    class Broken(Platform):
+        supports_bitlocker = True
+
+        def bitlocker_status(self, disk):
+            raise RuntimeError(r"Invalid namespace <root\cimv2\Security>")
+
+    src = bl_disk()
+    w = CloneWizard(Broken(), [src], src)
+    try:
+        _wait(app, w)
+        text = w.bl_label.text()
+        assert "Invalid namespace" in text and "manage-bde -off" in text
+        assert "Detalle:" in text and "&lt;root" in text          # escapado
+        assert not w.btn_next.isEnabled() and w.btn_bl_decrypt.isHidden()
+    finally:
+        w.close()

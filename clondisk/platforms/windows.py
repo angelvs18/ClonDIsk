@@ -814,10 +814,16 @@ if ($pd) {{
         return run_ps(script, timeout=120)
 
     def bitlocker_status(self, disk: Disk) -> Optional[List[BitLockerVolume]]:
+        """Lanza CommandError con el motivo si no se puede consultar (p. ej. «Acceso
+        denegado» sin permisos de administrador o «Invalid namespace» sin BitLocker)."""
         try:
-            return parse_bitlocker_volumes(self.bitlocker_status_raw(disk))
-        except (CommandError, ValueError, subprocess.TimeoutExpired):
-            return None
+            raw = self.bitlocker_status_raw(disk)
+        except subprocess.TimeoutExpired:
+            raise CommandError("La consulta de BitLocker por WMI no respondió a tiempo")
+        try:
+            return parse_bitlocker_volumes(raw)
+        except ValueError as e:
+            raise CommandError(f"Respuesta de WMI no válida: {e}")
 
     def decrypt_bitlocker(self, vol: BitLockerVolume, log: LogFn) -> None:
         drive = volume_arg(vol.letter, vol.device_id)

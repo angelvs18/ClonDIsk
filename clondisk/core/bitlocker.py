@@ -149,9 +149,11 @@ def _manual_steps(drive: str) -> str:
             "descifrado» / «Fully Decrypted»).")
 
 
-def assess_bitlocker(disk: Disk, vols: Optional[Sequence[BitLockerVolume]]) -> Optional[BitLockerReport]:
+def assess_bitlocker(disk: Disk, vols: Optional[Sequence[BitLockerVolume]],
+                     detail: str = "") -> Optional[BitLockerReport]:
     """Estado de las particiones BitLocker de ``disk`` (``None`` si no tiene ninguna).
-    ``vols=None`` significa que no se pudo consultar (o la plataforma no lo admite)."""
+    ``vols=None`` significa que no se pudo consultar (o la plataforma no lo admite);
+    ``detail`` es el motivo, si se conoce (se muestra como «Detalle: …»)."""
     parts = bitlocker_partitions(disk)
     if not parts:
         return None
@@ -191,6 +193,8 @@ def assess_bitlocker(disk: Disk, vols: Optional[Sequence[BitLockerVolume]]) -> O
         lead = ("El disco de origen tiene BitLocker. Hay que descifrarlo por completo antes de "
                 "clonar: suspender BitLocker no basta, porque los datos siguen cifrados en el disco.")
     rep.lines = [lead] + body
+    if detail:
+        rep.lines.append(f"Detalle: {detail}")
     for name in locked:
         rep.lines.append(f"{name} está bloqueado: desbloquéalo en el Explorador (doble clic e "
                          "introduce la contraseña o la clave de recuperación) y pulsa «Actualizar estado».")

@@ -538,13 +538,13 @@ class CloneWizard(QDialog):
         platform = self.platform
 
         def work():
-            vols = None
+            vols, detail = None, ""
             if platform.supports_bitlocker:
                 try:
                     vols = platform.bitlocker_status(src)
-                except Exception:
-                    vols = None
-            rep = assess_bitlocker(src, vols)
+                except Exception as e:            # la GUI sigue funcionando: pasos manuales
+                    vols, detail = None, str(e).strip() or type(e).__name__
+            rep = assess_bitlocker(src, vols, detail)
             disks = None
             if rep is not None and rep.all_decrypted:
                 try:
@@ -559,7 +559,7 @@ class CloneWizard(QDialog):
             if self.source is None or self.source.number != src.number:
                 self._bl_check()                    # el usuario cambió de origen mientras tanto
                 return
-            vols, rep, disks = res if not err else (None, assess_bitlocker(src, None), None)
+            vols, rep, disks = res if not err else (None, assess_bitlocker(src, None, str(err)), None)
             now = time.monotonic()
             for v in vols or []:
                 if v.decrypting and v.percent is not None:

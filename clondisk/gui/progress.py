@@ -379,7 +379,8 @@ class ProgressDialog(QDialog):
                          f"{html.escape(fmt_lbas(result.bad_sectors))}")
         if result.success and not self.plan.options.dry_run and source_windows(self.plan.source):
             rows = "".join(f"<div>•&nbsp; {html.escape(x)}</div>"
-                           for x in post_migration_checklist(self._final_uefi(result)))
+                           for x in post_migration_checklist(
+                               self._final_uefi(result), self.plan.options.bitlocker_decrypted))
             parts.append(f"<b>Después de la migración</b>{rows}")
         if parts:
             self.checks.setText("<br><br>".join(parts))

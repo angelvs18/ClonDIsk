@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional, Tuple
 
+from ..core.bitlocker import BitLockerVolume
 from ..core.device import Device
 from ..core.model import Disk, Partition
 from ..core.winprep import CfaStatus, DiskHealth, DriverBackup, StaticIp, WinreStatus
@@ -131,3 +132,14 @@ class Platform:
 
     def min_partition_size(self, disk: Disk, part: Partition) -> Optional[int]:
         return None
+
+    # --- BitLocker en el origen --------------------------------------------
+    supports_bitlocker = False
+
+    def bitlocker_status(self, disk: Disk) -> Optional[List[BitLockerVolume]]:
+        """Volúmenes BitLocker del disco (None = no se puede consultar en esta plataforma)."""
+        return None
+
+    def decrypt_bitlocker(self, vol: BitLockerVolume, log: LogFn) -> None:
+        """Pide a Windows que descifre el volumen (el descifrado sigue en segundo plano)."""
+        raise NotImplementedError("Descifrar BitLocker no está disponible en esta plataforma")

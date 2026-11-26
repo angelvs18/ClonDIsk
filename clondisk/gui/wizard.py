@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import html
-from typing import List, Optional
+import time
+from typing import Dict, List, Optional, Set, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
                                QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
                                QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
                                QRadioButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget,
                                QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget)
 
+from ..core.bitlocker import (POLL_SECONDS, BitLockerReport, assess_bitlocker,
+                              bitlocker_partitions, decrypt_confirm_text, estimate_seconds_left,
+                              fmt_eta, volume_arg)
 from ..core.model import MiB, Disk, Partition, fmt_size
 from ..core.planner import (CloneOptions, ClonePlan, build_plan, estimate_minutes,
                             fmt_minutes_range, resizable_candidates, shrink_target_bytes)
@@ -124,6 +128,15 @@ class CloneWizard(QDialog):
         self.pending: dict = {}                     # número de disco → actualizaciones pendientes
         self.cfa_override = False                   # el usuario confirmó seguir sin permitirlo
         self._preflight_running = False
+        # BitLocker en el origen
+        self.bl_report: Optional[BitLockerReport] = None
+        self.bl_disk: Optional[int] = None          # disco al que corresponde bl_report
+        self.bl_samples: Dict[str, List[Tuple[float, float]]] = {}   # DeviceID → (t, % cifrado)
+        self.bl_decrypted_disks: Set[int] = set()   # discos descifrados desde el asistente
+        self._bl_running = False
+        self.bl_timer = QTimer(self)
+        self.bl_timer.setInterval(POLL_SECONDS * 1000)
+        self.bl_timer.timeout.connect(lambda: self._bl_check(force=True))
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -218,7 +231,7 @@ class CloneWizard(QDialog):
     def _update_next(self):
         i = self.stack.currentIndex()
         ok = {
-            0: self.source is not None,
+            0: self.source is not None and not bitlocker_partitions(self.source),
             1: self.target is not None,
             2: True,
             3: bool(self.plan and self.plan.ok),
@@ -435,6 +448,24 @@ class CloneWizard(QDialog):
         self.src_layout = QVBoxLayout(self.src_body)
         self.src_layout.setSpacing(10)
         lay.addWidget(scroll_wrap(self.src_body), 1)
+        # Aviso de BitLocker debajo de las tarjetas (fuera del scroll: siempre visible).
+        self.bl_box = QWidget()
+        bl = QVBoxLayout(self.bl_box)
+        bl.setContentsMargins(0, 6, 0, 0)
+        self.bl_label = banner("", "error")
+        bl.addWidget(self.bl_label)
+        row = QHBoxLayout()
+        self.btn_bl_decrypt = QPushButton("Descifrar…")
+        self.btn_bl_decrypt.setObjectName("Primary")
+        self.btn_bl_decrypt.clicked.connect(self._bl_decrypt)
+        self.btn_bl_refresh = QPushButton("Actualizar estado")
+        self.btn_bl_refresh.clicked.connect(lambda: self._bl_check(force=True))
+        row.addWidget(self.btn_bl_decrypt)
+        row.addWidget(self.btn_bl_refresh)
+        row.addStretch(1)
+        bl.addLayout(row)
+        self.bl_box.hide()
+        lay.addWidget(self.bl_box)
         return w
 
     def _clear(self, layout):
@@ -444,6 +475,10 @@ class CloneWizard(QDialog):
                 it.widget().deleteLater()
 
     def _refresh_source_page(self):
+        self._build_source_cards()
+        self._bl_check()
+
+    def _build_source_cards(self):
         self._clear(self.src_layout)
         self.src_cards = []
         for d in self.disks:
@@ -463,7 +498,178 @@ class CloneWizard(QDialog):
         self.source = disk
         for c in self.src_cards:
             c.set_selected(c.disk.number == disk.number)
+        self._bl_check()
         self._update_next()
+
+    # ------------------------------------------------------------------ BitLocker en el origen
+    def _bl_decrypted_here(self) -> bool:
+        return self.source is not None and self.source.number in self.bl_decrypted_disks
+
+    def _bl_stop(self):
+        self.bl_timer.stop()
+
+    def _bl_check(self, force: bool = False):
+        """Consulta (en segundo plano) el estado BitLocker del origen y actualiza el aviso.
+        Si todo quedó descifrado, vuelve a leer los discos: el sector de arranque debe ser NTFS."""
+        src = self.source
+        if src is None or not bitlocker_partitions(src):
+            self._bl_stop()
+            self.bl_report, self.bl_disk = None, None
+            self.bl_box.hide()
+            self._update_next()
+            return
+        if self._bl_running:
+            return
+        if not force and self.bl_disk == src.number and self.bl_report is not None:
+            self._bl_show()
+            return
+        if self.bl_disk != src.number:
+            self.bl_samples = {}
+            self.bl_report = None
+            self.bl_disk = src.number
+        if self.bl_report is None:
+            self.bl_label.setProperty("kind", "warn")
+            self.bl_label.setText("<b>BitLocker en el disco de origen</b><br>Consultando su estado…")
+            self._repolish(self.bl_label)
+            self.btn_bl_decrypt.hide()
+            self.bl_box.show()
+        self._bl_running = True
+        self.btn_bl_refresh.setEnabled(False)
+        platform = self.platform
+
+        def work():
+            vols, detail = None, ""
+            if platform.supports_bitlocker:
+                try:
+                    vols = platform.bitlocker_status(src)
+                except Exception as e:            # la GUI sigue funcionando: pasos manuales
+                    vols, detail = None, str(e).strip() or type(e).__name__
+            rep = assess_bitlocker(src, vols, detail)
+            disks = None
+            if rep is not None and rep.all_decrypted:
+                try:
+                    disks = platform.list_disks()
+                except Exception:
+                    disks = None
+            return vols, rep, disks
+
+        def done(res, err):
+            self._bl_running = False
+            self.btn_bl_refresh.setEnabled(True)
+            if self.source is None or self.source.number != src.number:
+                self._bl_check()                    # el usuario cambió de origen mientras tanto
+                return
+            vols, rep, disks = res if not err else (None, assess_bitlocker(src, None, str(err)), None)
+            now = time.monotonic()
+            for v in vols or []:
+                if v.decrypting and v.percent is not None:
+                    self.bl_samples.setdefault(v.device_id, []).append((now, v.percent))
+            if disks:
+                self._bl_replace_disks(disks)
+                if not bitlocker_partitions(self.source):
+                    self._bl_finished()
+                    return
+            self.bl_report = rep
+            if rep is not None and (rep.decrypting or rep.all_decrypted):
+                if not self.bl_timer.isActive():
+                    self.bl_timer.start()
+            else:
+                self._bl_stop()
+            self._bl_show()
+
+        run_in_thread(self, work, on_done=done)
+
+    def _bl_replace_disks(self, disks: List[Disk]):
+        self.disks = disks
+        by_num = {d.number: d for d in disks}
+        self.source = by_num.get(self.source.number, self.source) if self.source else None
+        self.target = by_num.get(self.target.number) if self.target else None
+        if self.stack.currentIndex() == 0:
+            self._build_source_cards()
+
+    def _bl_finished(self):
+        self._bl_stop()
+        self.bl_report = None
+        self.bl_box.hide()
+        if self._bl_decrypted_here():
+            self.options.bitlocker_decrypted = True
+        self._update_next()
+        QApplication.alert(self)
+        QMessageBox.information(
+            self, "BitLocker",
+            "Windows terminó de descifrar el disco de origen. Ya puedes continuar con la clonación.")
+
+    def _bl_eta(self) -> Optional[float]:
+        rep = self.bl_report
+        if not rep or not rep.decrypting:
+            return None
+        etas = [estimate_seconds_left(self.bl_samples.get(v.device_id, [])) for _p, v in rep.decrypting]
+        return None if any(e is None for e in etas) else max(etas)
+
+    @staticmethod
+    def _repolish(wdg):
+        wdg.style().unpolish(wdg)
+        wdg.style().polish(wdg)
+
+    def _bl_show(self):
+        rep = self.bl_report
+        if rep is None:
+            self.bl_box.hide()
+            self._update_next()
+            return
+        e = html.escape
+        lines = [e(x) for x in rep.lines]
+        if rep.decrypting:
+            lines.append(f"<b>Tiempo restante:</b> {e(fmt_eta(self._bl_eta()))} "
+                         f"(se vuelve a comprobar cada {POLL_SECONDS} s).")
+        self.bl_label.setProperty("kind", rep.level)
+        self.bl_label.setText("<b>🔒 BitLocker en el disco de origen</b><br>" + "<br>".join(lines))
+        self._repolish(self.bl_label)
+        self.btn_bl_decrypt.setVisible(bool(rep.decryptable) and self.platform.supports_bitlocker)
+        self.bl_box.show()
+        self._update_next()
+
+    def _bl_decrypt(self):
+        rep, src = self.bl_report, self.source
+        if rep is None or src is None or not rep.decryptable:
+            return
+        pairs = list(rep.decryptable)
+        r = QMessageBox.warning(self, "Descifrar BitLocker", decrypt_confirm_text(src, pairs),
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+
+        def work():
+            # Cada volumen por separado: si uno falla, los demás igual se intentan.
+            started, errors = [], []
+            for p, v in pairs:
+                try:
+                    self.platform.decrypt_bitlocker(v, lambda *a: None)
+                    started.append(p.display_name())
+                except Exception as e:
+                    errors.append((p, v, str(e).strip() or type(e).__name__))
+            return started, errors
+
+        def done(res, err):
+            started, errors = res if not err else ([], [(p, v, str(err)) for p, v in pairs])
+            if started:
+                self.bl_decrypted_disks.add(src.number)
+            if errors:
+                lines = "\n".join(f"• {p.display_name()} — {msg}" for p, _v, msg in errors)
+                manual = "\n".join(f"    manage-bde -off {volume_arg(p.letter or v.letter, v.device_id)}"
+                                   for p, v, _m in errors)
+                ok = f"Se inició el descifrado de {', '.join(started)}.\n\n" if started else ""
+                QMessageBox.critical(
+                    self, "Descifrar BitLocker",
+                    f"{ok}No se pudo iniciar el descifrado de:\n{lines}\n\nAlternativa: ejecuta como "
+                    f"administrador\n{manual}\ny pulsa «Actualizar estado».")
+            self._bl_check(force=True)
+
+        self._run_busy(work, done)
+
+    def done(self, r):
+        self._bl_stop()
+        super().done(r)
 
     # ------------------------------------------------------------------ página 2: destino
     def _build_target_page(self):
@@ -688,6 +894,7 @@ class CloneWizard(QDialog):
             convert_to_gpt=(self.source is not None and self.source.style == "MBR"
                             and self.rb_to_gpt.isChecked() and self.rb_to_gpt.isEnabled()),
             new_hardware=self.chk_newhw.isChecked(),
+            bitlocker_decrypted=self._bl_decrypted_here(),
         )
 
     # ------------------------------------------------------------------ página 4: particiones
@@ -1125,7 +1332,8 @@ class CloneWizard(QDialog):
                          "reactivación por el cambio de hardware.")
         extra_html = "".join(f"<li>{e(x)}</li>" for x in extra)
         after_html = "".join(f"<li>{e(x)}</li>"
-                             for x in post_migration_checklist(p.final_firmware == "UEFI"))
+                             for x in post_migration_checklist(p.final_firmware == "UEFI",
+                                                               o.bitlocker_decrypted))
         self.summary.setHtml(f"""
         <h3>Origen</h3><p>{e(p.source.title())}{win_html}</p>
         {health_html}

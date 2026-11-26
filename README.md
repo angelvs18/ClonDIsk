@@ -71,6 +71,17 @@ También puedes ejecutarlo sin instalar: `pip install -r requirements.txt` y lue
 5. Revisa el resumen, confirma e inicia.
 6. Al terminar, pulsa **Preparar para desconectar el disco destino**, apaga el equipo, desconecta el HDD (o cámbialo de lugar) y en la BIOS/UEFI elige el SSD como primer dispositivo de arranque.
 
+### Si el origen tiene BitLocker
+
+Suspender BitLocker no basta: los datos siguen cifrados en el disco y ClonDisk lee el sector de arranque y `$Bitmap` en crudo. Hay que **descifrar por completo**.
+
+- En el paso «Disco de origen», el asistente muestra el estado de cada volumen (cifrado, protección suspendida, descifrándose, bloqueado) y no deja continuar mientras haya particiones BitLocker.
+- **Descifrar…** pide confirmación y le pide a Windows que descifre (WMI `Win32_EncryptableVolume.Decrypt`). No se pierden datos, puedes seguir usando el equipo y, si reinicias, continúa solo. En un HDD puede tardar varias horas.
+- Mientras tanto, el estado se consulta cada 20 s con el tiempo restante estimado. Cuando Windows termina, ClonDisk vuelve a leer los discos y avisa que ya puedes continuar.
+- Si un volumen está bloqueado, desbloquéalo en el Explorador y pulsa **Actualizar estado**.
+- A mano: `manage-bde -off C:` y `manage-bde -status C:` (como administrador).
+- Después de clonar, vuelve a activar BitLocker en el SSD (`manage-bde -on C: -UsedSpaceOnly`), guarda la nueva clave de recuperación y, cuando ya no lo necesites, cifra o borra el disco de origen, que quedó sin cifrar.
+
 ### Después de migrar a otro equipo
 
 Lo aprendido en una migración real (HDD MBR con Windows 10 → SSD convertido a GPT/UEFI → HP 260 G4):
@@ -109,6 +120,7 @@ clondisk/
 │   ├── fs.py             # Detección de FS, $Bitmap NTFS, etiquetas, hidden sectors
 │   ├── scan.py           # Lee la estructura de un disco desde sus sectores
 │   ├── planner.py        # Calcula la distribución del destino y valida
+│   ├── bitlocker.py      # Estado BitLocker del origen, avisos y textos del descifrado
 │   ├── copier.py         # Copia por rangos en pipeline, verificación y cancelación
 │   └── engine.py         # Orquesta los pasos de la clonación
 ├── platforms/
@@ -119,7 +131,8 @@ clondisk/
 
 ## Limitaciones
 
-- No admite discos dinámicos (LDM), Espacios de almacenamiento, particiones extendidas o lógicas MBR, ni volúmenes **BitLocker** activos (descífralos antes).
+- No admite discos dinámicos (LDM), Espacios de almacenamiento ni particiones extendidas o lógicas MBR.
+- Los volúmenes **BitLocker** del origen deben descifrarse por completo antes de clonar (suspender no basta). El asistente ofrece descifrarlos; ver «Si el origen tiene BitLocker».
 - El origen y el destino deben tener el **mismo tamaño de sector lógico**. Algunos adaptadores USB presentan el disco como 4Kn; si pasa, conecta el SSD por SATA o M.2, o usa otro adaptador.
 - La conversión MBR → GPT depende de `mbr2gpt` (máximo 3 particiones primarias en el origen). Si falla, el destino queda en MBR y el registro muestra `setupact.log` y `setuperr.log`.
 - Si la partición de recuperación cambia de posición, al arrancar desde el SSD ejecuta `reagentc /disable` y luego `reagentc /enable` para re-registrar WinRE.
